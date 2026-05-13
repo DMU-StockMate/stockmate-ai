@@ -1,35 +1,40 @@
 from datetime import datetime, timedelta
 from langchain_ollama import ChatOllama
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
-from langchain_chroma import Chroma
+from langchain_core.messages import HumanMessage, AIMessage
 from app.services.rag.vectorstore import get_vectorstore
 from app.core.config import settings
+from app.schemas.chat import Message
 
-RAG_PROMPT = ChatPromptTemplate.from_template("""
-당신은 친절하고 전문적인 주식 투자 코치입니다.
+RAG_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """당신은 친절하고 전문적인 주식 투자 코치입니다.
 아래 참고 자료를 바탕으로 사용자의 질문에 답변해주세요.
 모르는 내용은 모른다고 솔직하게 말하고, 투자 판단은 사용자 본인이 하도록 안내하세요.
 
 [참고 자료]
-{context}
+{context}"""),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "{question}"),
+])
 
-[질문]
-{question}
-
-[답변]
-""")
-
-GENERAL_PROMPT = ChatPromptTemplate.from_template("""
-당신은 친절하고 전문적인 주식 투자 코치입니다.
+GENERAL_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """당신은 친절하고 전문적인 주식 투자 코치입니다.
 주식 투자와 관련된 질문에 성실하게 답변해주세요.
-투자 판단은 사용자 본인이 하도록 안내하세요.
+투자 판단은 사용자 본인이 하도록 안내하세요."""),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "{question}"),
+])
 
-[질문]
-{question}
 
-[답변]
-""")
+def _convert_history(history: list[Message]) -> list:
+    result = []
+    for msg in history:
+        if msg.role == "user":
+            result.append(HumanMessage(content=msg.content))
+        elif msg.role == "assistant":
+            result.append(AIMessage(content=msg.content))
+    return result
 
 
 def _get_llm() -> ChatOllama:
@@ -37,7 +42,7 @@ def _get_llm() -> ChatOllama:
         base_url=settings.OLLAMA_BASE_URL,
         model=settings.LLM_MODEL,
         temperature=0.3,
-        reasoning=False
+        reasoning=False,
     )
 
 
@@ -83,34 +88,43 @@ def _format_docs(docs) -> str:
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-async def run_rag_chain(question: str, tickers: list[str]) -> str:
-    """종목 관련 질문 — RAG"""
+async def run_rag_chain(question: str, tickers: list[str], history: list[Message]) -> str:
     retriever = _get_retriever(tickers)
     docs = await retriever.ainvoke(question)
     context = _format_docs(docs)
-
     chain = RAG_PROMPT | _get_llm() | StrOutputParser()
-    return await chain.ainvoke({"context": context, "question": question})
+    return await chain.ainvoke({
+        "context": context,
+        "history": _convert_history(history),
+        "question": question,
+    })
 
 
-async def run_general_chain(question: str) -> str:
-    """일반 질문 — LLM 직접 답변"""
+async def run_general_chain(question: str, history: list[Message]) -> str:
     chain = GENERAL_PROMPT | _get_llm() | StrOutputParser()
-    return await chain.ainvoke({"question": question})
+    return await chain.ainvoke({
+        "history": _convert_history(history),
+        "question": question,
+    })
 
-async def stream_rag_chain(question: str, tickers: list[str]):
-    """RAG 스트리밍"""
+
+async def stream_rag_chain(question: str, tickers: list[str], history: list[Message]):
     retriever = _get_retriever(tickers)
     docs = await retriever.ainvoke(question)
     context = _format_docs(docs)
-
     chain = RAG_PROMPT | _get_llm() | StrOutputParser()
-    async for chunk in chain.astream({"context": context, "question": question}):
+    async for chunk in chain.astream({
+        "context": context,
+        "history": _convert_history(history),
+        "question": question,
+    }):
         yield chunk
 
 
-async def stream_general_chain(question: str):
-    """일반 질문 스트리밍"""
+async def stream_general_chain(question: str, history: list[Message]):
     chain = GENERAL_PROMPT | _get_llm() | StrOutputParser()
-    async for chunk in chain.astream({"question": question}):
+    async for chunk in chain.astream({
+        "history": _convert_history(history),
+        "question": question,
+    }):
         yield chunk

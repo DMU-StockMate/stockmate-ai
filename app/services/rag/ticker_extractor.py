@@ -82,3 +82,15 @@ def extract_tickers(question: str, score_cutoff: int = 75) -> list[str]:
                 found.append(match_name)
 
     return found
+
+def extract_tickers_from_history(history: list) -> list[str]:
+    found = []
+    for msg in history:
+        # user 메시지에서만 추출
+        if msg.role != "user":
+            continue
+        tickers = extract_tickers(msg.content)
+        for t in tickers:
+            if t not in found:
+                found.append(t)
+    return found
