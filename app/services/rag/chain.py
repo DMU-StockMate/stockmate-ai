@@ -97,3 +97,20 @@ async def run_general_chain(question: str) -> str:
     """일반 질문 — LLM 직접 답변"""
     chain = GENERAL_PROMPT | _get_llm() | StrOutputParser()
     return await chain.ainvoke({"question": question})
+
+async def stream_rag_chain(question: str, tickers: list[str]):
+    """RAG 스트리밍"""
+    retriever = _get_retriever(tickers)
+    docs = await retriever.ainvoke(question)
+    context = _format_docs(docs)
+
+    chain = RAG_PROMPT | _get_llm() | StrOutputParser()
+    async for chunk in chain.astream({"context": context, "question": question}):
+        yield chunk
+
+
+async def stream_general_chain(question: str):
+    """일반 질문 스트리밍"""
+    chain = GENERAL_PROMPT | _get_llm() | StrOutputParser()
+    async for chunk in chain.astream({"question": question}):
+        yield chunk
