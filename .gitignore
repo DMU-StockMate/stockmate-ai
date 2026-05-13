@@ -1,0 +1,12 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.gguf
+*.bin
+*.safetensors
+lora_weights/
+data/
+chroma_storage/
