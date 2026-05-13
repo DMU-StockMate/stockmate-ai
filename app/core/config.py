@@ -3,8 +3,8 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     LLM_MODEL: str = "qwen3.5:9b"
-    CHROMA_HOST: str = "localhost"
-    CHROMA_PORT: int = 8000
+    CHROMA_PERSIST_DIR: str = "./chroma_storage"
+    EMBEDDING_MODEL: str = "BAAI/bge-m3"
     DART_API_KEY: str = ""
     NAVER_CLIENT_ID: str = ""
     NAVER_CLIENT_SECRET: str = ""
