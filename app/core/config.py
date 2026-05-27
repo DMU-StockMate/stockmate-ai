@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     DART_API_KEY: str = ""
     NAVER_CLIENT_ID: str = ""
     NAVER_CLIENT_SECRET: str = ""
+    KIS_APP_KEY: str = ""
+    KIS_APP_SECRET: str = ""
+    KIS_ACCOUNT: str = ""
 
     class Config:
         env_file = ".env"

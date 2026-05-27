@@ -6,6 +6,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from app.services.rag.vectorstore import get_vectorstore
 from app.core.config import settings
 from app.schemas.chat import Message, QuizContext
+from app.services.external.kis import get_stocks_info
 
 LEVEL_GUIDE = {
     "입문": "아주 쉽게, 비유를 들어 초등학생도 이해할 수 있게 설명해주세요.",
@@ -128,6 +129,17 @@ def _format_choices(choices) -> str:
         for c in choices
     )
 
+def _format_stock_data(stocks: dict) -> str:
+    if not stocks:
+        return ""
+    lines = ["[실시간 주가 데이터]"]
+    for ticker, data in stocks.items():
+        lines.append(
+            f"{ticker}: 현재가 {data['current_price']:,}원 "
+            f"({data['change_rate']:+.2f}%) | "
+            f"PER {data['per']} | PBR {data['pbr']} | EPS {data['eps']:,}"
+        )
+    return "\n".join(lines)
 
 async def run_rag_chain(
     question: str,
@@ -138,6 +150,13 @@ async def run_rag_chain(
     retriever = _get_retriever(tickers)
     docs = await retriever.ainvoke(question)
     context = _format_docs(docs)
+
+    # 주가 데이터 추가
+    stocks = await get_stocks_info(tickers)
+    stock_context = _format_stock_data(stocks)
+    if stock_context:
+        context = f"{stock_context}\n\n{context}"
+
     chain = RAG_PROMPT | _get_llm() | StrOutputParser()
     return await chain.ainvoke({
         "context": context,
@@ -188,6 +207,13 @@ async def stream_rag_chain(
     retriever = _get_retriever(tickers)
     docs = await retriever.ainvoke(question)
     context = _format_docs(docs)
+
+    # 주가 데이터 추가
+    stocks = await get_stocks_info(tickers)
+    stock_context = _format_stock_data(stocks)
+    if stock_context:
+        context = f"{stock_context}\n\n{context}"
+
     chain = RAG_PROMPT | _get_llm() | StrOutputParser()
     async for chunk in chain.astream({
         "context": context,

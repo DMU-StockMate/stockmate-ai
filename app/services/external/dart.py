@@ -8,6 +8,7 @@ DART_BASE_URL = "https://opendart.fss.or.kr/api"
 
 # 앱 시작 시 한 번만 로드
 _corp_code_map: dict[str, str] = {}
+_stock_code_map: dict[str, str] = {}
 
 async def load_corp_codes() -> None:
     """DART 전체 회사 코드 목록 로드"""
@@ -31,6 +32,7 @@ async def load_corp_codes() -> None:
         # 상장사만 저장 (stock_code 있는 것)
         if name and code and stock_code:
             _corp_code_map[name] = code
+            _stock_code_map[name] = stock_code
 
 async def get_corp_code(corp_name: str) -> str | None:
     await load_corp_codes()
