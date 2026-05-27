@@ -12,18 +12,3 @@ async def test_stock(ticker_name: str):
     
     result = await get_stock_info(ticker_name, stock_code)
     return result
-
-from app.services.external.dart import get_disclosures
-
-@router.get("/test-dart/{ticker}")
-async def test_dart(ticker: str):
-    result = await get_disclosures(ticker, days=90)
-    return {"count": len(result), "data": result}
-
-
-@router.get("/test-ingest/{ticker}")
-async def test_ingest(ticker: str):
-    from app.services.rag.ingestion import ingest_news, ingest_disclosures
-    news = await ingest_news(ticker)
-    dart = await ingest_disclosures(ticker)
-    return {"news": news, "dart": dart}
