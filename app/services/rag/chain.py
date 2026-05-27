@@ -8,6 +8,8 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
 from app.services.rag.vectorstore import get_vectorstore
 from app.core.config import settings
 from app.schemas.chat import Message, QuizContext
+from app.core.logger import setup_logger
+logger = setup_logger(__name__)
 
 LEVEL_GUIDE = {
     "입문": "아주 쉽게, 비유를 들어 초등학생도 이해할 수 있게 설명해주세요.",
@@ -140,6 +142,7 @@ def _format_choices(choices) -> str:
 
 
 async def run_rag_chain(question: str, tickers: list[str], history: list[Message], investment_level: str = "미설정") -> str:
+    logger.info(f"RAG 체인 실행 [{', '.join(tickers)}]: {question[:30]}...")
     retriever = _get_retriever(tickers)
     docs = await retriever.ainvoke(question)
     context = _format_docs(docs)
@@ -159,6 +162,7 @@ async def run_rag_chain(question: str, tickers: list[str], history: list[Message
 
 
 async def run_general_chain(question: str, history: list[Message], investment_level: str = "미설정") -> str:
+    logger.info(f"일반 체인 실행: {question[:30]}...")
     chain = GENERAL_PROMPT | _get_llm() | StrOutputParser()
     return await chain.ainvoke({
         "history": _convert_history(history),
@@ -195,6 +199,7 @@ def _format_stock_data(stocks: dict) -> str:
 
 
 async def stream_rag_chain(question: str, tickers: list[str], history: list[Message], investment_level: str = "미설정"):
+    logger.info(f"RAG 스트리밍 [{', '.join(tickers)}]: {question[:30]}...")
     retriever = _get_retriever(tickers)
     docs = await retriever.ainvoke(question)
     context = _format_docs(docs)
@@ -214,6 +219,7 @@ async def stream_rag_chain(question: str, tickers: list[str], history: list[Mess
 
 
 async def stream_general_chain(question: str, history: list[Message], investment_level: str = "미설정"):
+    logger.info(f"일반 스트리밍: {question[:30]}...")
     chain = GENERAL_PROMPT | _get_llm() | StrOutputParser()
     async for chunk in chain.astream({
         "history": _convert_history(history),
@@ -224,6 +230,7 @@ async def stream_general_chain(question: str, history: list[Message], investment
 
 
 async def stream_quiz_chain(question: str, history: list[Message], quiz_context: QuizContext, investment_level: str = "미설정"):
+    logger.info(f"퀴즈 스트리밍: {question[:30]}...")
     chain = QUIZ_PROMPT | _get_llm() | StrOutputParser()
     async for chunk in chain.astream({
         "history": _convert_history(history),
