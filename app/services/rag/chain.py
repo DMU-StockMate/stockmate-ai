@@ -5,12 +5,22 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage
 from app.services.rag.vectorstore import get_vectorstore
 from app.core.config import settings
-from app.schemas.chat import Message
+from app.schemas.chat import Message, QuizContext
+
+LEVEL_GUIDE = {
+    "입문": "아주 쉽게, 비유를 들어 초등학생도 이해할 수 있게 설명해주세요.",
+    "초급": "쉬운 용어로 기본 개념 위주로 설명해주세요.",
+    "중급": "전문 용어를 사용하되 핵심을 간결하게 설명해주세요.",
+    "고급": "심층적인 분석과 전문적인 시각으로 설명해주세요.",
+    "미설정": "친절하게 설명해주세요.",
+}
 
 RAG_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """당신은 친절하고 전문적인 주식 투자 코치입니다.
 아래 참고 자료를 바탕으로 사용자의 질문에 답변해주세요.
 모르는 내용은 모른다고 솔직하게 말하고, 투자 판단은 사용자 본인이 하도록 안내하세요.
+
+사용자 수준: {level_guide}
 
 [참고 자료]
 {context}"""),
@@ -21,10 +31,37 @@ RAG_PROMPT = ChatPromptTemplate.from_messages([
 GENERAL_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """당신은 친절하고 전문적인 주식 투자 코치입니다.
 주식 투자와 관련된 질문에 성실하게 답변해주세요.
-투자 판단은 사용자 본인이 하도록 안내하세요."""),
+투자 판단은 사용자 본인이 하도록 안내하세요.
+
+사용자 수준: {level_guide}"""),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{question}"),
 ])
+
+QUIZ_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """당신은 친절하고 전문적인 주식 투자 코치입니다.
+아래 문제를 바탕으로 사용자의 질문에 답변해주세요.
+
+사용자 수준: {level_guide}
+
+[문제 정보]
+- 문제 유형: {question_type}
+- 문제: {question_text}
+- 선택지: {choices}
+- 해설: {explanation}
+- 주제: {topic}"""),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "{question}"),
+])
+
+
+def _get_llm() -> ChatOllama:
+    return ChatOllama(
+        base_url=settings.OLLAMA_BASE_URL,
+        model=settings.LLM_MODEL,
+        temperature=0.3,
+        reasoning=False,
+    )
 
 
 def _convert_history(history: list[Message]) -> list:
@@ -37,13 +74,8 @@ def _convert_history(history: list[Message]) -> list:
     return result
 
 
-def _get_llm() -> ChatOllama:
-    return ChatOllama(
-        base_url=settings.OLLAMA_BASE_URL,
-        model=settings.LLM_MODEL,
-        temperature=0.3,
-        reasoning=False,
-    )
+def _get_level_guide(investment_level: str) -> str:
+    return LEVEL_GUIDE.get(investment_level, LEVEL_GUIDE["미설정"])
 
 
 def _get_retriever(tickers: list[str]):
@@ -88,7 +120,21 @@ def _format_docs(docs) -> str:
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-async def run_rag_chain(question: str, tickers: list[str], history: list[Message]) -> str:
+def _format_choices(choices) -> str:
+    if not choices:
+        return "없음"
+    return "\n".join(
+        f"{c.choice_no}. {c.text} {'(정답)' if c.is_correct else ''}"
+        for c in choices
+    )
+
+
+async def run_rag_chain(
+    question: str,
+    tickers: list[str],
+    history: list[Message],
+    investment_level: str = "미설정",
+) -> str:
     retriever = _get_retriever(tickers)
     docs = await retriever.ainvoke(question)
     context = _format_docs(docs)
@@ -97,18 +143,48 @@ async def run_rag_chain(question: str, tickers: list[str], history: list[Message
         "context": context,
         "history": _convert_history(history),
         "question": question,
+        "level_guide": _get_level_guide(investment_level),
     })
 
 
-async def run_general_chain(question: str, history: list[Message]) -> str:
+async def run_general_chain(
+    question: str,
+    history: list[Message],
+    investment_level: str = "미설정",
+) -> str:
     chain = GENERAL_PROMPT | _get_llm() | StrOutputParser()
     return await chain.ainvoke({
         "history": _convert_history(history),
         "question": question,
+        "level_guide": _get_level_guide(investment_level),
     })
 
 
-async def stream_rag_chain(question: str, tickers: list[str], history: list[Message]):
+async def run_quiz_chain(
+    question: str,
+    history: list[Message],
+    quiz_context: QuizContext,
+    investment_level: str = "미설정",
+) -> str:
+    chain = QUIZ_PROMPT | _get_llm() | StrOutputParser()
+    return await chain.ainvoke({
+        "history": _convert_history(history),
+        "question": question,
+        "level_guide": _get_level_guide(investment_level),
+        "question_type": quiz_context.question_type,
+        "question_text": quiz_context.question_text,
+        "choices": _format_choices(quiz_context.choices),
+        "explanation": quiz_context.explanation or "없음",
+        "topic": quiz_context.topic,
+    })
+
+
+async def stream_rag_chain(
+    question: str,
+    tickers: list[str],
+    history: list[Message],
+    investment_level: str = "미설정",
+):
     retriever = _get_retriever(tickers)
     docs = await retriever.ainvoke(question)
     context = _format_docs(docs)
@@ -117,14 +193,40 @@ async def stream_rag_chain(question: str, tickers: list[str], history: list[Mess
         "context": context,
         "history": _convert_history(history),
         "question": question,
+        "level_guide": _get_level_guide(investment_level),
     }):
         yield chunk
 
 
-async def stream_general_chain(question: str, history: list[Message]):
+async def stream_general_chain(
+    question: str,
+    history: list[Message],
+    investment_level: str = "미설정",
+):
     chain = GENERAL_PROMPT | _get_llm() | StrOutputParser()
     async for chunk in chain.astream({
         "history": _convert_history(history),
         "question": question,
+        "level_guide": _get_level_guide(investment_level),
+    }):
+        yield chunk
+
+
+async def stream_quiz_chain(
+    question: str,
+    history: list[Message],
+    quiz_context: QuizContext,
+    investment_level: str = "미설정",
+):
+    chain = QUIZ_PROMPT | _get_llm() | StrOutputParser()
+    async for chunk in chain.astream({
+        "history": _convert_history(history),
+        "question": question,
+        "level_guide": _get_level_guide(investment_level),
+        "question_type": quiz_context.question_type,
+        "question_text": quiz_context.question_text,
+        "choices": _format_choices(quiz_context.choices),
+        "explanation": quiz_context.explanation or "없음",
+        "topic": quiz_context.topic,
     }):
         yield chunk
