@@ -2,7 +2,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.routers import chat, quiz, stock
 from app.services.external.dart import load_corp_codes
+import os
+from app.core.config import settings
 
+if settings.HF_TOKEN:
+    os.environ["HF_TOKEN"] = settings.HF_TOKEN
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

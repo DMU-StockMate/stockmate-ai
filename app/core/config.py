@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     KIS_APP_KEY: str = ""
     KIS_APP_SECRET: str = ""
     KIS_ACCOUNT: str = ""
+    HF_TOKEN: str = ""
 
     class Config:
         env_file = ".env"
