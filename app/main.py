@@ -3,7 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from app.routers import chat, quiz, stock
+from app.routers import chat, quiz
 from app.services.external.dart import load_corp_codes
 from app.core.config import settings
 from app.core.logger import setup_logger
@@ -28,7 +28,6 @@ app = FastAPI(title="StockMate AI", version="0.1.0", lifespan=lifespan)
 
 app.include_router(chat.router)
 app.include_router(quiz.router)
-app.include_router(stock.router)
 
 
 @app.exception_handler(Exception)
