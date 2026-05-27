@@ -1,8 +1,11 @@
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
 from app.core.config import settings
 
 _embeddings = None
+_client = None
 
 def get_embeddings() -> HuggingFaceEmbeddings:
     global _embeddings
@@ -14,9 +17,32 @@ def get_embeddings() -> HuggingFaceEmbeddings:
         )
     return _embeddings
 
-def get_vectorstore(collection_name: str = "stockmate") -> Chroma:
-    return Chroma(
-        collection_name=collection_name,
-        embedding_function=get_embeddings(),
-        persist_directory=settings.CHROMA_PERSIST_DIR,
+
+def get_qdrant_client() -> QdrantClient:
+    global _client
+    if _client is None:
+        _client = QdrantClient(
+            host=settings.QDRANT_HOST,
+            port=settings.QDRANT_PORT,
+        )
+    return _client
+
+
+def ensure_collection():
+    """컬렉션 없으면 생성"""
+    client = get_qdrant_client()
+    collections = [c.name for c in client.get_collections().collections]
+    if settings.QDRANT_COLLECTION not in collections:
+        client.create_collection(
+            collection_name=settings.QDRANT_COLLECTION,
+            vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
+        )
+
+
+def get_vectorstore() -> QdrantVectorStore:
+    ensure_collection()
+    return QdrantVectorStore(
+        client=get_qdrant_client(),
+        collection_name=settings.QDRANT_COLLECTION,
+        embedding=get_embeddings(),
     )

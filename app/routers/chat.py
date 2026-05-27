@@ -115,6 +115,7 @@ async def chat_stream(req: ChatStreamRequest):
 
         try:
             if req.quiz_context:
+                ingested = {}
                 yield f"data: {json.dumps({'type': 'meta', 'tickers': [], 'timestamp': started_at}, ensure_ascii=False)}\n\n"
 
                 async for chunk in stream_quiz_chain(
@@ -148,7 +149,7 @@ async def chat_stream(req: ChatStreamRequest):
                         yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
 
             elapsed = round(time.time() - start_time, 2)
-            yield f"data: {json.dumps({'type': 'done', 'ingested': {}, 'elapsed_sec': elapsed, 'timestamp': datetime.now().isoformat()}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'ingested': ingested, 'elapsed_sec': elapsed, 'timestamp': datetime.now().isoformat()}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
         except Exception as e:
