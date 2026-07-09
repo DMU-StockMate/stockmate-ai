@@ -26,6 +26,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="StockMate AI", version="0.1.0", lifespan=lifespan)
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(chat.router)
 app.include_router(quiz.router)
 

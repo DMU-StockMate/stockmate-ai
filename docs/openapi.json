@@ -1,0 +1,516 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "StockMate AI",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/chat/stream": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "백엔드 전용 통합 채팅 스트리밍",
+        "description": "NestJS 백엔드에서 호출하는 SSE 스트리밍 엔드포인트입니다.\n\n---\n\n**SSE 이벤트 순서**\n\n1. meta 이벤트 - 스트리밍 시작 시 1회 전송\n2. token 이벤트 - 답변 토큰 순차 전송\n3. done 이벤트 - 스트리밍 완료 시 1회 전송\n\n---\n\n**이벤트별 데이터 형식**\n\nmeta:\n```json\n{\n    \"type\": \"meta\",\n    \"tickers\": [\"삼성전자\", \"SK하이닉스\"],\n    \"timestamp\": \"2026-05-27T14:30:00\"\n}\n```\n\ntoken:\n```json\n{\n    \"type\": \"token\",\n    \"content\": \"안녕하세요\"\n}\n```\n\ndone:\n```json\n{\n    \"type\": \"done\",\n    \"ingested\": {\n        \"삼성전자\": {\n            \"news\": 5,\n            \"dart\": 3\n        }\n    },\n    \"elapsed_sec\": 3.42,\n    \"timestamp\": \"2026-05-27T14:30:03\"\n}\n```\n\nerror (에러 발생 시):\n```json\n{\n    \"type\": \"error\",\n    \"message\": \"에러 내용\",\n    \"elapsed_sec\": 1.23\n}\n```\n\n---\n\n**일반 채팅 (quiz_context: null)**\n- 질문에서 종목명 자동 추출\n- 종목 있으면 뉴스/공시 기반 RAG 답변\n- 종목 없으면 LLM 직접 답변\n- investment_level에 맞게 답변 난이도 조절\n\n**문제 기반 Q&A (quiz_context 포함)**\n- RAG 없이 문제 정보 기반으로 답변\n- 사용자 수준에 맞게 설명 난이도 조절\n\n---\n\n**investment_level 값**\n- 입문 / 초급 / 중급 / 고급 / 미설정\n\n**주의사항**\n- history는 최근 10개만 포함\n- history 없으면 빈 배열로 전송\n- quiz_context.explanation은 null 허용",
+        "operationId": "chat_stream_chat_stream_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatStreamRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SSE 스트리밍 성공",
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "text/event-stream": {
+                "example": "data: {\"type\": \"token\", \"content\": \"안녕하세요\"}\n\n"
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/quiz/generate": {
+      "post": {
+        "tags": [
+          "quiz"
+        ],
+        "summary": "AI 퀴즈 문제 생성",
+        "description": "LLM을 사용해 사용자 수준에 맞는 주식 투자 퀴즈 문제를 생성합니다.\n\n**지원 문제 유형**\n\nOX 문제 (quiz_type: \"OX\")\n- O/X 2개 선택지\n- choice_no 1 = O, choice_no 2 = X\n\n객관식 4지선다 (quiz_type: \"MULTIPLE_CHOICE\")\n- 4개 선택지\n- choice_no 1~4\n\n**investment_level별 난이도**\n- 입문: 주식, 배당 등 아주 기초 개념\n- 초급: PER, PBR, ROE 등 기본 지표\n- 중급: 재무제표 해석, 투자 전략\n- 고급: 심화 분석, 고급 전략\n\n**topic 미입력시** 수준에 맞는 주제 자동 선택\n\n**count** (기본값 1)\n- 같은 topic으로 count개 문제를 한 번에 생성합니다.\n- 응답은 항상 `questions` 배열입니다 (count=1이어도 배열 안에 1개).\n- 순차 생성이라 count가 클수록 응답 시간이 비례해서 늘어납니다.\n\n**주의사항**\n- LLM이 생성하므로 문제 1개당 최대 3번 재시도\n- 재시도 후에도 실패시 500 에러 반환",
+        "operationId": "generate_quiz_generate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuizGenerateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "문제 생성 성공",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuizGenerateBatchResponse"
+                },
+                "examples": {
+                  "OX": {
+                    "summary": "OX 문제 예시 (count=1)",
+                    "value": {
+                      "questions": [
+                        {
+                          "question_type": "OX",
+                          "question_text": "PER이 낮을수록 주식이 저평가되어 있다고 볼 수 있다.",
+                          "choices": [
+                            {
+                              "choice_no": 1,
+                              "text": "O",
+                              "is_correct": false
+                            },
+                            {
+                              "choice_no": 2,
+                              "text": "X",
+                              "is_correct": true
+                            }
+                          ],
+                          "explanation": "PER은 업종별로 달리 해석해야 합니다.",
+                          "topic": "PER",
+                          "level": "초급"
+                        }
+                      ]
+                    }
+                  },
+                  "MULTIPLE_CHOICE": {
+                    "summary": "객관식 문제 예시 (count=1)",
+                    "value": {
+                      "questions": [
+                        {
+                          "question_type": "MULTIPLE_CHOICE",
+                          "question_text": "PER을 구하는 공식은?",
+                          "choices": [
+                            {
+                              "choice_no": 1,
+                              "text": "주가 / 주당순이익",
+                              "is_correct": true
+                            },
+                            {
+                              "choice_no": 2,
+                              "text": "주가 / 주당순자산",
+                              "is_correct": false
+                            },
+                            {
+                              "choice_no": 3,
+                              "text": "순이익 / 자기자본",
+                              "is_correct": false
+                            },
+                            {
+                              "choice_no": 4,
+                              "text": "주가 / 매출액",
+                              "is_correct": false
+                            }
+                          ],
+                          "explanation": "PER = 주가 / EPS(주당순이익)입니다.",
+                          "topic": "PER",
+                          "level": "초급"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "문제 생성 실패 (LLM 재시도 초과)"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ChatStreamRequest": {
+        "properties": {
+          "question": {
+            "type": "string",
+            "title": "Question"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            },
+            "type": "array",
+            "title": "History",
+            "default": []
+          },
+          "user": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "quiz_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuizContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "question"
+        ],
+        "title": "ChatStreamRequest"
+      },
+      "Choice": {
+        "properties": {
+          "choice_no": {
+            "type": "integer",
+            "title": "Choice No"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "is_correct": {
+            "type": "boolean",
+            "title": "Is Correct"
+          }
+        },
+        "type": "object",
+        "required": [
+          "choice_no",
+          "text",
+          "is_correct"
+        ],
+        "title": "Choice"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "Message": {
+        "properties": {
+          "role": {
+            "type": "string",
+            "title": "Role"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          }
+        },
+        "type": "object",
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "Message"
+      },
+      "QuizChoice": {
+        "properties": {
+          "choice_no": {
+            "type": "integer",
+            "title": "Choice No"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "is_correct": {
+            "type": "boolean",
+            "title": "Is Correct"
+          }
+        },
+        "type": "object",
+        "required": [
+          "choice_no",
+          "text",
+          "is_correct"
+        ],
+        "title": "QuizChoice"
+      },
+      "QuizContext": {
+        "properties": {
+          "question_id": {
+            "type": "integer",
+            "title": "Question Id"
+          },
+          "question_type": {
+            "type": "string",
+            "title": "Question Type"
+          },
+          "question_text": {
+            "type": "string",
+            "title": "Question Text"
+          },
+          "explanation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Explanation"
+          },
+          "topic": {
+            "type": "string",
+            "title": "Topic",
+            "default": "미분류"
+          },
+          "level": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level"
+          },
+          "category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category"
+          },
+          "choices": {
+            "items": {
+              "$ref": "#/components/schemas/Choice"
+            },
+            "type": "array",
+            "title": "Choices",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "question_id",
+          "question_type",
+          "question_text"
+        ],
+        "title": "QuizContext"
+      },
+      "QuizGenerateBatchResponse": {
+        "properties": {
+          "questions": {
+            "items": {
+              "$ref": "#/components/schemas/QuizGenerateResponse"
+            },
+            "type": "array",
+            "title": "Questions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "questions"
+        ],
+        "title": "QuizGenerateBatchResponse"
+      },
+      "QuizGenerateRequest": {
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/UserContext"
+          },
+          "quiz_type": {
+            "type": "string",
+            "title": "Quiz Type"
+          },
+          "topic": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topic"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 1
+          }
+        },
+        "type": "object",
+        "required": [
+          "user",
+          "quiz_type"
+        ],
+        "title": "QuizGenerateRequest"
+      },
+      "QuizGenerateResponse": {
+        "properties": {
+          "question_type": {
+            "type": "string",
+            "title": "Question Type"
+          },
+          "question_text": {
+            "type": "string",
+            "title": "Question Text"
+          },
+          "choices": {
+            "items": {
+              "$ref": "#/components/schemas/QuizChoice"
+            },
+            "type": "array",
+            "title": "Choices"
+          },
+          "explanation": {
+            "type": "string",
+            "title": "Explanation"
+          },
+          "topic": {
+            "type": "string",
+            "title": "Topic"
+          },
+          "level": {
+            "type": "string",
+            "title": "Level"
+          }
+        },
+        "type": "object",
+        "required": [
+          "question_type",
+          "question_text",
+          "choices",
+          "explanation",
+          "topic",
+          "level"
+        ],
+        "title": "QuizGenerateResponse"
+      },
+      "UserContext": {
+        "properties": {
+          "user_id": {
+            "type": "integer",
+            "title": "User Id"
+          },
+          "investment_level": {
+            "type": "string",
+            "title": "Investment Level",
+            "default": "미설정"
+          }
+        },
+        "type": "object",
+        "required": [
+          "user_id"
+        ],
+        "title": "UserContext"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

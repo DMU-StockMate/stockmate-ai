@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from app.schemas.chat import AskRequest, AskResponse, ChatStreamRequest
-from app.services.rag.ingestion import ingest_news, ingest_disclosures
+from app.services.rag.ingestion import ingest_news, ingest_disclosures, ingest_financials
 from app.services.rag.chain import (
     run_rag_chain, run_general_chain, run_quiz_chain,
     stream_rag_chain, stream_general_chain, stream_quiz_chain,
@@ -119,7 +119,8 @@ async def chat_stream(req: ChatStreamRequest):
                 yield f"data: {json.dumps({'type': 'meta', 'tickers': [], 'timestamp': started_at}, ensure_ascii=False)}\n\n"
 
                 async for chunk in stream_quiz_chain(
-                    req.question, req.history, req.quiz_context, investment_level
+                    req.question, req.history, req.quiz_context, investment_level,
+                    ingested_out=ingested,
                 ):
                     yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
 
@@ -135,7 +136,12 @@ async def chat_stream(req: ChatStreamRequest):
                     for ticker in tickers:
                         news_count = await ingest_news(ticker)
                         dart_count = await ingest_disclosures(ticker)
-                        ingested[ticker] = {"news": news_count, "dart": dart_count}
+                        financials_count = await ingest_financials(ticker)
+                        ingested[ticker] = {
+                            "news": news_count,
+                            "dart": dart_count,
+                            "dart_financials": financials_count,
+                        }
 
                 if tickers:
                     async for chunk in stream_rag_chain(
@@ -170,7 +176,12 @@ async def ask(req: AskRequest):
         for ticker in tickers:
             news_count = await ingest_news(ticker)
             dart_count = await ingest_disclosures(ticker)
-            ingested[ticker] = {"news": news_count, "dart": dart_count}
+            financials_count = await ingest_financials(ticker)
+            ingested[ticker] = {
+                "news": news_count,
+                "dart": dart_count,
+                "dart_financials": financials_count,
+            }
         answer = await run_rag_chain(req.question, tickers, req.history)
     else:
         answer = await run_general_chain(req.question, req.history)
@@ -201,7 +212,12 @@ async def ask_stream(req: AskRequest):
                 for ticker in tickers:
                     news_count = await ingest_news(ticker)
                     dart_count = await ingest_disclosures(ticker)
-                    ingested[ticker] = {"news": news_count, "dart": dart_count}
+                    financials_count = await ingest_financials(ticker)
+                    ingested[ticker] = {
+                        "news": news_count,
+                        "dart": dart_count,
+                        "dart_financials": financials_count,
+                    }
 
             if tickers:
                 async for chunk in stream_rag_chain(req.question, tickers, req.history):

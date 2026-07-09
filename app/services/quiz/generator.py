@@ -19,6 +19,15 @@ OX_TOPICS = [
     "손절매", "익절매", "포트폴리오", "리스크 관리",
 ]
 
+# _get_random_topic()에서 MULTIPLE_CHOICE용으로 참조하는데 정의가 누락돼 있었음
+# (topic 없이 객관식 문제 생성 요청하면 NameError로 500 에러가 나던 버그)
+MC_TOPICS = [
+    "PER", "PBR", "ROE", "EPS", "배당수익률", "시가총액",
+    "코스피", "코스닥", "ETF", "공매도", "분산투자",
+    "손절매", "익절매", "포트폴리오", "리스크 관리",
+    "재무제표", "영업이익", "당기순이익", "부채비율", "유상증자",
+]
+
 MC_PROMPT = ChatPromptTemplate.from_template("""
 당신은 주식 투자 교육 전문가입니다.
 아래 조건에 맞는 4지선다 객관식 문제를 1개 생성하세요.
@@ -213,3 +222,28 @@ async def generate_quiz(user: UserContext, quiz_type: str, topic: str = None) ->
         return await generate_mc_question(user, topic)
     else:
         raise ValueError(f"지원하지 않는 문제 유형: {quiz_type}")
+
+
+async def generate_quiz_batch(user: UserContext, quiz_type: str, topic: str = None, count: int = 1) -> list[dict]:
+    """같은 topic으로 count개의 문제를 순차 생성한다.
+
+    로컬 Ollama가 단일 모델 인스턴스라 동시 요청을 병렬로 못 받는 경우가 많아
+    순차 생성으로 처리한다 (팀 논의 결과 - 속도보단 안정성 우선).
+    같은 topic으로 여러 번 생성하면 LLM이 같은 문제를 반복할 수 있어서,
+    문제 텍스트가 이전에 나온 것과 겹치면 한 번 더 재생성을 시도한다
+    (그래도 겹치면 마지막 결과를 그대로 채택 - count는 항상 맞춰야 하므로).
+    """
+    if not topic:
+        topic = _get_random_topic(quiz_type)
+
+    questions: list[dict] = []
+    seen_texts: set[str] = set()
+
+    for _ in range(count):
+        question = await generate_quiz(user, quiz_type, topic)
+        if question["question_text"] in seen_texts:
+            question = await generate_quiz(user, quiz_type, topic)  # 중복이면 1회 재시도
+        seen_texts.add(question["question_text"])
+        questions.append(question)
+
+    return questions
