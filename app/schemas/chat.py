@@ -24,7 +24,10 @@ class QuizContext(BaseModel):
     question_text: str
     explanation: Optional[str] = None
     topic: str = "미분류"
-    level: str = "미설정"
+    # NestJS가 category/level을 null로 보내는 경우가 있어 Optional로 둔다.
+    # (필드가 str이고 null이 오면 Pydantic이 422로 요청 전체를 거부해버림)
+    level: Optional[str] = None
+    category: Optional[str] = None  # "concept" | "metric" | "news" | "disclosure"
     choices: list[Choice] = []
 
 
