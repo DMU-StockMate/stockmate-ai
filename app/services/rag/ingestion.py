@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 import hashlib
 from datetime import datetime, timedelta
@@ -5,7 +6,7 @@ from email.utils import parsedate_to_datetime
 from langchain_core.documents import Document
 from app.services.rag.vectorstore import get_vectorstore
 from app.services.external.naver_news import search_news
-from app.services.external.dart import get_disclosures, get_financial_statements
+from app.services.external.dart import get_disclosures, get_financial_statements, get_disclosure_document
 from app.core.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -77,9 +78,20 @@ def _format_krw_human(amount_str: str) -> str:
     return f"{sign}{abs_amount:,}원"
 
 
-def _parse_pub_date(pub_date: str) -> int:
-    dt = parsedate_to_datetime(pub_date)
-    return int(dt.strftime("%Y%m%d"))
+def _parse_pub_date(pub_date: str) -> int | None:
+    """RFC822 형식 pubDate → YYYYMMDD int. 파싱 실패 시 None.
+
+    parsedate_to_datetime는 형식이 어긋나면 None을 반환하거나 예외를 던진다.
+    이전엔 방어가 없어 None.strftime()에서 죽고 요청 전체가 500이 났다
+    (네이버가 이따금 비정상 pubDate를 섞어 보내면 특정 종목에서만 재현).
+    """
+    try:
+        dt = parsedate_to_datetime(pub_date)
+        if dt is None:
+            return None
+        return int(dt.strftime("%Y%m%d"))
+    except (TypeError, ValueError):
+        return None
 
 
 async def ingest_news(ticker: str, display: int = 10) -> int:
@@ -95,6 +107,10 @@ async def ingest_news(ticker: str, display: int = 10) -> int:
     docs, ids = [], []
 
     for item in items:
+        published_at = _parse_pub_date(item["pub_date"])
+        if published_at is None:
+            logger.warning(f"뉴스 날짜 파싱 실패 - 스킵 [{ticker}]: {item.get('pub_date')!r}")
+            continue
         content = f"{item['title']}\n{item['description']}"
         doc_id = _make_id(item["link"])
         docs.append(Document(
@@ -102,24 +118,24 @@ async def ingest_news(ticker: str, display: int = 10) -> int:
             metadata={
                 "ticker": ticker,
                 "source": "naver_news",
-                "published_at": _parse_pub_date(item["pub_date"]),
+                "published_at": published_at,
                 "link": item["link"],
             }
         ))
         ids.append(doc_id)
 
+    # 이미 적재된 문서 id를 한 번의 retrieve로 배치 조회한다.
+    # (기존엔 문서마다 retrieve를 호출해 뉴스 10건이면 10번 왕복 → 지연 컸음)
     client = vs.client
+    try:
+        existing = client.retrieve(collection_name=vs.collection_name, ids=ids)
+        existing_ids = {str(p.id) for p in existing}
+    except Exception:
+        existing_ids = set()
+
     new_docs, new_ids = [], []
     for doc, id_ in zip(docs, ids):
-        try:
-            results = client.retrieve(
-                collection_name=vs.collection_name,
-                ids=[id_],
-            )
-            if not results:
-                new_docs.append(doc)
-                new_ids.append(id_)
-        except Exception:
+        if id_ not in existing_ids:
             new_docs.append(doc)
             new_ids.append(id_)
 
@@ -145,12 +161,35 @@ async def ingest_disclosures(ticker: str, days: int = 90) -> int:
         return 0
 
     vs = get_vectorstore()
-    docs, ids = [], []
 
-    for item in items:
+    # 1) 먼저 id를 계산하고 기존재 문서를 배치 retrieve로 걸러낸다.
+    #    (공시 원문 조회는 비싸므로 '새 공시'에 대해서만 본문을 받는다)
+    ids = [_make_id(item["url"]) for item in items]
+    client = vs.client
+    try:
+        existing = client.retrieve(collection_name=vs.collection_name, ids=ids)
+        existing_ids = {str(p.id) for p in existing}
+    except Exception:
+        existing_ids = set()
+
+    new_items = [(item, id_) for item, id_ in zip(items, ids) if id_ not in existing_ids]
+    if not new_items:
+        _update_dart_cache(ticker)
+        return 0
+
+    # 2) 새 공시의 원문 본문을 병렬로 조회 (실패 시 빈 문자열 → 제목만 저장)
+    bodies = await asyncio.gather(
+        *[get_disclosure_document(item["rcept_no"]) for item, _ in new_items]
+    )
+
+    # 3) 제목·날짜 + (있으면) 본문을 담아 Document 구성.
+    #    제목만 있던 기존 방식은 LLM이 '공시 내용'을 지어내게 만들었다 - 본문을 근거로 제공한다.
+    new_docs, new_ids = [], []
+    for (item, id_), body in zip(new_items, bodies):
         content = f"{item['corp_name']} 공시: {item['title']}\n날짜: {item['date']}"
-        doc_id = _make_id(item["url"])
-        docs.append(Document(
+        if body:
+            content += f"\n내용: {body}"
+        new_docs.append(Document(
             page_content=content,
             metadata={
                 "ticker": ticker,
@@ -159,30 +198,14 @@ async def ingest_disclosures(ticker: str, days: int = 90) -> int:
                 "link": item["url"],
             }
         ))
-        ids.append(doc_id)
+        new_ids.append(id_)
 
-    client = vs.client
-    new_docs, new_ids = [], []
-    for doc, id_ in zip(docs, ids):
-        try:
-            results = client.retrieve(
-                collection_name=vs.collection_name,
-                ids=[id_],
-            )
-            if not results:
-                new_docs.append(doc)
-                new_ids.append(id_)
-        except Exception:
-            new_docs.append(doc)
-            new_ids.append(id_)
-
-    if new_docs:
-        try:
-            vs.add_documents(documents=new_docs, ids=new_ids)
-            logger.info(f"공시 적재 [{ticker}]: {len(new_docs)}건")
-        except Exception as e:
-            logger.error(f"공시 적재 실패 [{ticker}]: {e}")
-            return 0
+    try:
+        vs.add_documents(documents=new_docs, ids=new_ids)
+        logger.info(f"공시 적재 [{ticker}]: {len(new_docs)}건 (본문 포함 {sum(1 for b in bodies if b)}건)")
+    except Exception as e:
+        logger.error(f"공시 적재 실패 [{ticker}]: {e}")
+        return 0
 
     _update_dart_cache(ticker)
     return len(new_docs)

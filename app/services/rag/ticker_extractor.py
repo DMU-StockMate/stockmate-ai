@@ -21,7 +21,7 @@ ALIAS_MAP = {
 
 # 제거할 조사/어미 목록
 JOSA_PATTERN = re.compile(
-    r"(이랑|이랑|랑|이랑|와|과|은|는|이|가|을|를|의|도|만|에서|에|로|으로|까지|부터|이나|나)$"
+    r"(이랑|랑|와|과|은|는|이|가|을|를|의|도|만|에서|에|로|으로|까지|부터|이나|나)$"
 )
 
 
@@ -34,7 +34,12 @@ def extract_tickers(question: str, score_cutoff: int = 75) -> list[str]:
         return []
 
     corp_names = list(_corp_code_map.keys())
+    corp_name_set = set(corp_names)
     found = []
+
+    def _add(name: str) -> None:
+        if name not in found:
+            found.append(name)
 
     # 토큰 분리 + 조사 제거
     raw_tokens = question.replace(",", " ").replace(".", " ").split()
@@ -50,26 +55,33 @@ def extract_tickers(question: str, score_cutoff: int = 75) -> list[str]:
             if len(combined) >= 2:
                 candidates.add(combined)
 
+    # 각 후보는 "정확 일치 > 축약어 > 엄격 substring > 퍼지" 순으로 딱 한 단계에서만
+    # 확정한다. 이전 구현은 substring 매칭 후에도 continue가 안쪽 루프만 돌아 퍼지가
+    # 항상 실행됐고(엉뚱한 종목 혼입), substring 임계값(0.4)도 느슨해 "삼성"/"전자" 같은
+    # 짧은 토큰이 다수 종목에 매칭돼 오추출이 잦았다.
     for candidate in candidates:
-        # 1. 축약어 사전 우선 적용
-        if candidate in ALIAS_MAP:
-            match_name = ALIAS_MAP[candidate]
-            if match_name not in found:
-                found.append(match_name)
+        # 1. 회사명과 정확히 일치 (가장 신뢰도 높음)
+        if candidate in corp_name_set:
+            _add(candidate)
             continue
 
-        # 2. 후보가 회사명에 포함되는 경우만 허용 (방향 제한)
-        #    ex) "하이닉스" → "SK하이닉스" O / "이닉스" → "SK하이닉스" X
+        # 2. 축약어 사전
+        if candidate in ALIAS_MAP:
+            _add(ALIAS_MAP[candidate])
+            continue
+
+        # 3. 엄격 substring: 후보가 회사명의 60% 이상을 커버할 때만 인정하고,
+        #    여러 개가 걸리면 후보와 가장 가까운(가장 짧은) 이름 하나만 채택해 과매칭 방지.
+        #    ex) "하이닉스"(4) -> "SK하이닉스"(6) O / "전자"(2) -> "삼성전자"(4) X
         matched = [
             name for name in corp_names
-            if candidate in name and len(candidate) >= len(name) * 0.4
+            if candidate in name and len(candidate) >= len(name) * 0.6
         ]
-        for match_name in matched:
-            if match_name not in found:
-                found.append(match_name)
+        if matched:
+            _add(min(matched, key=len))
             continue
 
-        # 3. 직접 포함 안 되면 퍼지 매칭 (오타 대비)
+        # 4. 위 단계에서 못 잡으면 퍼지 매칭 (오타 대비)
         result = process.extractOne(
             candidate,
             corp_names,
@@ -77,11 +89,10 @@ def extract_tickers(question: str, score_cutoff: int = 75) -> list[str]:
             score_cutoff=score_cutoff,
         )
         if result:
-            match_name = result[0]
-            if match_name not in found:
-                found.append(match_name)
+            _add(result[0])
 
     return found
+
 
 def extract_tickers_from_history(history: list) -> list[str]:
     found = []

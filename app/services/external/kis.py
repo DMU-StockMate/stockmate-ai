@@ -1,6 +1,10 @@
+import asyncio
 import httpx
 from datetime import datetime, timedelta
 from app.core.config import settings
+from app.core.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
@@ -51,7 +55,16 @@ async def get_stock_info(ticker_name: str, stock_code: str) -> dict:
             },
         )
         response.raise_for_status()
-        data = response.json()["output"]
+        payload = response.json()
+
+    # KIS는 HTTP 200이어도 rt_cd로 성공/실패를 구분한다("0"=성공).
+    # 확인하지 않으면 output이 비어 KeyError가 나고, 호출부에서 조용히 삼켜져 시세만 누락된다.
+    if payload.get("rt_cd") != "0":
+        raise ValueError(
+            f"KIS 시세 조회 실패 [{ticker_name}/{stock_code}]: "
+            f"{payload.get('msg_cd')} {payload.get('msg1')}"
+        )
+    data = payload["output"]
 
     return {
         "ticker": ticker_name,
@@ -66,16 +79,26 @@ async def get_stock_info(ticker_name: str, stock_code: str) -> dict:
 
 
 async def get_stocks_info(ticker_names: list[str]) -> dict[str, dict]:
-    """여러 종목 한번에 조회"""
+    """여러 종목을 병렬로 조회. 실패한 종목은 로그를 남기고 건너뛴다."""
     from app.services.external.dart import _stock_code_map
 
-    results = {}
-    for ticker_name in ticker_names:
-        stock_code = _stock_code_map.get(ticker_name)
-        if not stock_code:
+    targets = [
+        (name, _stock_code_map[name])
+        for name in ticker_names
+        if _stock_code_map.get(name)
+    ]
+    if not targets:
+        return {}
+
+    fetched = await asyncio.gather(
+        *[get_stock_info(name, code) for name, code in targets],
+        return_exceptions=True,
+    )
+
+    results: dict[str, dict] = {}
+    for (name, _code), outcome in zip(targets, fetched):
+        if isinstance(outcome, Exception):
+            logger.warning(f"KIS 시세 누락 [{name}]: {outcome}")
             continue
-        try:
-            results[ticker_name] = await get_stock_info(ticker_name, stock_code)
-        except Exception:
-            continue
+        results[name] = outcome
     return results

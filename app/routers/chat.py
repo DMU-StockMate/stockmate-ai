@@ -6,12 +6,27 @@ from fastapi.responses import StreamingResponse
 from app.schemas.chat import AskRequest, AskResponse, ChatStreamRequest
 from app.services.rag.ingestion import ingest_news, ingest_disclosures, ingest_financials
 from app.services.rag.chain import (
-    run_rag_chain, run_general_chain, run_quiz_chain,
+    run_rag_chain, run_general_chain, run_quiz_chain, run_rag_evaluate,
     stream_rag_chain, stream_general_chain, stream_quiz_chain,
 )
 from app.services.rag.ticker_extractor import extract_tickers, extract_tickers_from_history
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+
+async def _ingest_all_sources(tickers: list[str]) -> dict:
+    """티커별 뉴스/공시/재무를 적재하고 건수를 dict로 모아 반환한다.
+
+    chat_stream / ask / ask_stream 세 곳에 동일하게 복붙돼 있던 적재 루프를 통합한 헬퍼.
+    """
+    ingested: dict = {}
+    for ticker in tickers:
+        ingested[ticker] = {
+            "news": await ingest_news(ticker),
+            "dart": await ingest_disclosures(ticker),
+            "dart_financials": await ingest_financials(ticker),
+        }
+    return ingested
 
 
 @router.post(
@@ -133,17 +148,7 @@ async def chat_stream(req: ChatStreamRequest):
                 yield f"data: {json.dumps({'type': 'meta', 'tickers': tickers, 'timestamp': started_at}, ensure_ascii=False)}\n\n"
 
                 if tickers:
-                    for ticker in tickers:
-                        news_count = await ingest_news(ticker)
-                        dart_count = await ingest_disclosures(ticker)
-                        financials_count = await ingest_financials(ticker)
-                        ingested[ticker] = {
-                            "news": news_count,
-                            "dart": dart_count,
-                            "dart_financials": financials_count,
-                        }
-
-                if tickers:
+                    ingested = await _ingest_all_sources(tickers)
                     async for chunk in stream_rag_chain(
                         req.question, tickers, req.history, investment_level
                     ):
@@ -161,6 +166,7 @@ async def chat_stream(req: ChatStreamRequest):
         except Exception as e:
             elapsed = round(time.time() - start_time, 2)
             yield f"data: {json.dumps({'type': 'error', 'message': str(e), 'elapsed_sec': elapsed}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -173,15 +179,7 @@ async def ask(req: AskRequest):
 
     ingested = {}
     if tickers:
-        for ticker in tickers:
-            news_count = await ingest_news(ticker)
-            dart_count = await ingest_disclosures(ticker)
-            financials_count = await ingest_financials(ticker)
-            ingested[ticker] = {
-                "news": news_count,
-                "dart": dart_count,
-                "dart_financials": financials_count,
-            }
+        ingested = await _ingest_all_sources(tickers)
         answer = await run_rag_chain(req.question, tickers, req.history)
     else:
         answer = await run_general_chain(req.question, req.history)
@@ -192,6 +190,64 @@ async def ask(req: AskRequest):
         answer=answer,
         ingested=ingested,
     )
+
+
+@router.post(
+    "/evaluate",
+    summary="RAG 검색 가시성 디버그 (비스트리밍)",
+    description="""
+스트리밍 없이 한 번에 응답하며, LLM이 실제로 무엇을 근거로 답했는지 노출한다.
+최신성/실시간 정확성 테스트의 기반 엔드포인트.
+
+**응답 필드**
+- `tickers`: 추출된 종목
+- `mode`: "rag" | "general" (종목 없으면 general)
+- `ingested`: 이번 호출에 적재된 뉴스/공시/재무 건수
+- `answer`: 최종 답변(비스트리밍)
+- `stock_data`: KIS 실시간 시세/지표
+- `context_sent_to_llm`: LLM 프롬프트에 실제로 들어간 컨텍스트 전문
+- `retrieved`: 검색 후보 목록. 각 항목에 `source`/`score`/`published_at`/`passed_score`/`taken`/`content`
+  - `passed_score`: min_score 임계값 통과 여부
+  - `taken`: 최종적으로 컨텍스트에 채택됐는지 (score 통과분 중 최신순 상위 take개)
+""",
+)
+async def chat_evaluate(req: ChatStreamRequest):
+    # 디버그 엔드포인트라 전역 500 핸들러가 에러를 가리지 않도록 여기서 잡아
+    # 실제 예외 메시지와 traceback을 그대로 반환한다(원인 파악용).
+    try:
+        investment_level = req.user.investment_level if req.user else "미설정"
+        tickers = extract_tickers(req.question)
+        if not tickers and req.history:
+            tickers = extract_tickers_from_history(req.history)
+
+        if not tickers:
+            answer = await run_general_chain(req.question, req.history, investment_level)
+            return {
+                "tickers": [],
+                "mode": "general",
+                "ingested": {},
+                "answer": answer,
+                "stock_data": {},
+                "retrieved": [],
+                "context_sent_to_llm": "",
+            }
+
+        ingested = await _ingest_all_sources(tickers)
+        result = await run_rag_evaluate(req.question, tickers, req.history, investment_level)
+        return {
+            "tickers": tickers,
+            "mode": "rag",
+            "ingested": ingested,
+            **result,
+        }
+    except Exception as e:
+        import traceback
+        logger.error(f"/chat/evaluate 실패: {e}", exc_info=True)
+        return {
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "traceback": traceback.format_exc(),
+        }
 
 
 @router.post("/ask/stream", include_in_schema=False)
@@ -209,17 +265,7 @@ async def ask_stream(req: AskRequest):
             yield f"data: {json.dumps({'type': 'meta', 'tickers': tickers, 'timestamp': started_at}, ensure_ascii=False)}\n\n"
 
             if tickers:
-                for ticker in tickers:
-                    news_count = await ingest_news(ticker)
-                    dart_count = await ingest_disclosures(ticker)
-                    financials_count = await ingest_financials(ticker)
-                    ingested[ticker] = {
-                        "news": news_count,
-                        "dart": dart_count,
-                        "dart_financials": financials_count,
-                    }
-
-            if tickers:
+                ingested = await _ingest_all_sources(tickers)
                 async for chunk in stream_rag_chain(req.question, tickers, req.history):
                     yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
             else:
@@ -233,5 +279,6 @@ async def ask_stream(req: AskRequest):
         except Exception as e:
             elapsed = round(time.time() - start_time, 2)
             yield f"data: {json.dumps({'type': 'error', 'message': str(e), 'elapsed_sec': elapsed}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")

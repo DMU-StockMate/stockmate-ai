@@ -1,3 +1,5 @@
+import html
+import re
 import httpx
 from app.core.config import settings
 from app.core.logger import setup_logger
@@ -5,6 +7,19 @@ from app.core.logger import setup_logger
 logger = setup_logger(__name__)
 
 NAVER_NEWS_URL = "https://openapi.naver.com/v1/search/news.json"
+
+_TAG_PATTERN = re.compile(r"<[^>]+>")
+
+
+def _clean_html(text: str) -> str:
+    """네이버 뉴스 title/description에 섞여오는 <b> 태그와 &quot; 같은 HTML 엔티티를 제거한다.
+
+    태그/엔티티가 그대로 임베딩·프롬프트 컨텍스트에 저장되면 검색 품질과 답변 가독성을
+    떨어뜨리므로 적재 전에 정리한다.
+    """
+    if not text:
+        return ""
+    return html.unescape(_TAG_PATTERN.sub("", text)).strip()
 
 async def search_news(query: str, display: int = 10) -> list[dict]:
     headers = {
@@ -25,8 +40,8 @@ async def search_news(query: str, display: int = 10) -> list[dict]:
             logger.info(f"Naver News [{query}]: {len(items)}건 조회")
             return [
                 {
-                    "title": item["title"],
-                    "description": item["description"],
+                    "title": _clean_html(item["title"]),
+                    "description": _clean_html(item["description"]),
                     "pub_date": item["pubDate"],
                     "link": item["link"],
                 }
