@@ -24,6 +24,9 @@ sys.path.insert(0, str(ROOT))
 CALLS: list[dict] = []       # 생성 호출에 들어간 프롬프트 인자
 RESPONSES: list[str] = []    # 미리 넣어둔 LLM 응답 (순서대로 소비)
 VALIDATE_RESULT: dict = {"results": []}
+BANK_SIMILARITY = None   # 퀴즈 뱅크가 돌려줄 유사도 (None이면 결과 없음)
+BANK_UPSERTS: list = []  # 뱅크에 저장된 호출 기록
+BANK_TOPIC_COUNT = 0     # 관점 오프셋용 - 주제별 기존 문제 수
 
 
 class _Resp:
@@ -105,6 +108,31 @@ def _install_stubs():
     class _Settings:
         OLLAMA_BASE_URL = "http://localhost:11434"
         LLM_MODEL = "qwen3.5:9b"
+        QUIZ_BANK_COLLECTION = "quiz_bank_test"
+        QUIZ_BANK_ENABLED = True
+        QUIZ_DUP_THRESHOLD = 0.90
+
+
+    # Qdrant / 임베딩 스텁 - 퀴즈 뱅크가 실제 서버를 찾지 않게 한다
+    vs = types.ModuleType("app.services.rag.vectorstore")
+    class _Emb:
+        def embed_query(self, t): return [0.0] * 1024
+        def embed_documents(self, ts): return [[0.0] * 1024 for _ in ts]
+    class _Hit:
+        def __init__(self, score): self.score = score
+    class _Client:
+        def get_collections(self):
+            return types.SimpleNamespace(collections=[])
+        def create_collection(self, **kw): pass
+        def create_payload_index(self, **kw): pass
+        def query_points(self, **kw):
+            points = [_Hit(BANK_SIMILARITY)] if BANK_SIMILARITY is not None else []
+            return types.SimpleNamespace(points=points)
+        def count(self, **kw): return types.SimpleNamespace(count=BANK_TOPIC_COUNT)
+        def upsert(self, **kw): BANK_UPSERTS.append(kw)
+    vs.get_embeddings = lambda: _Emb()
+    vs.get_qdrant_client = lambda: _Client()
+    sys.modules["app.services.rag.vectorstore"] = vs
 
     config.settings = _Settings()
     sys.modules["app.core.config"] = config
@@ -114,7 +142,8 @@ _install_stubs()
 
 from app.schemas.chat import UserContext                     # noqa: E402
 from app.schemas.quiz import WrongAnswerChoice, WrongAnswerItem  # noqa: E402
-from app.services.quiz import review as R                    # noqa: E402
+from app.services.quiz import quality as Q                    # noqa: E402
+from app.services.quiz import review as R                     # noqa: E402
 
 
 # =========================================================
@@ -245,14 +274,14 @@ def test_context():
 
 def test_dedup():
     print("\n--- 근사 중복 판정 ---")
-    check("동일 문장", R.is_near_duplicate("PER이 낮으면 저평가라고 볼 수 있는가",
+    check("동일 문장", Q.is_near_duplicate("PER이 낮으면 저평가라고 볼 수 있는가",
                                           ["PER이 낮으면 저평가라고 볼 수 있는가"]))
-    check("다른 문장 통과", not R.is_near_duplicate("배당수익률의 정의는 무엇인가",
+    check("다른 문장 통과", not Q.is_near_duplicate("배당수익률의 정의는 무엇인가",
                                                 ["PER 계산식은 주가 나누기 EPS이다"]))
-    check("빈 목록 통과", not R.is_near_duplicate("아무 문장", []))
+    check("빈 목록 통과", not Q.is_near_duplicate("아무 문장", []))
     # 짧은 문자열은 bigram이 불안정해 완전 일치만 중복으로 본다
-    check("짧은 문자열 오탐 없음", not R.is_near_duplicate("문제A", ["문제B"]))
-    check("짧은 문자열 완전일치는 감지", R.is_near_duplicate("문제A", ["문제A"]))
+    check("짧은 문자열 오탐 없음", not Q.is_near_duplicate("문제A", ["문제B"]))
+    check("짧은 문자열 완전일치는 감지", Q.is_near_duplicate("문제A", ["문제A"]))
 
 
 # =========================================================
@@ -340,7 +369,7 @@ def test_korean_guard():
     ]
     for name, text, should_pass in cases:
         try:
-            R._assert_korean(text, "검사")
+            Q.assert_korean(text, "검사")
             passed = True
         except AssertionError:
             passed = False

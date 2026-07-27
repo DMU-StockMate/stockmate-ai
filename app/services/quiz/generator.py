@@ -1,11 +1,29 @@
-import json
 import re
-from langchain_ollama import ChatOllama
+from collections import defaultdict
+
 from langchain_core.prompts import ChatPromptTemplate
-from app.core.config import settings
 from app.schemas.chat import UserContext
 from app.schemas.quiz import QuizCategoryIn
 from app.core.logger import setup_logger
+from app.services.quiz import bank
+from app.services.quiz.quality import (
+    ANGLE_BLOCK,
+    MC_QUALITY_RULES,
+    OX_QUALITY_RULES,
+    QUALITY_RULES,
+    angle_for,
+    check_mc_question,
+    check_ox_question,
+    extract_json,
+    format_avoid_block,
+    get_llm,
+    is_near_duplicate,
+    validate_questions,
+)
+
+# 하위 호환 별칭 (기존 코드/테스트가 _get_llm, _extract_json 이름을 참조한다)
+_get_llm = get_llm
+_extract_json = extract_json
 
 logger = setup_logger(__name__)
 
@@ -43,15 +61,10 @@ MC_PROMPT = ChatPromptTemplate.from_template("""
 조건:
 - 주제: {topic}
 - 난이도: {level} ({level_guide})
-- 문제는 반드시 한 문장으로 짧고 명확하게 작성하세요.
-- 복잡한 수치나 여러 개념을 동시에 묻는 문제는 절대 만들지 마세요.
-- 사용자 수준에 맞는 쉬운 용어만 사용하세요.
-- 문제·선택지·해설의 모든 텍스트는 한국어로 작성하세요.
-- 실제로 존재하는 개념·지표·용어만 사용하고, 존재하지 않는 용어를 지어내지 마세요.
-- 정답은 반드시 하나만 명확한 정답이어야 하고, 오답 선택지는 그럴듯하지만 분명히 틀린 내용이어야 합니다.
-- 정답 번호(correct_no)와 해설이 서로 모순되지 않아야 하며, 해설은 정답이 왜 맞고 오답이 왜 틀린지 설명하세요.
-- 반드시 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
-
+""" + QUALITY_RULES + """
+""" + MC_QUALITY_RULES + """
+- 해설은 정답이 왜 맞고 오답이 왜 틀린지 설명하세요.
+""" + ANGLE_BLOCK + """
 예시 (초급 수준):
 {{
   "question_text": "PER이 낮을수록 주식이 저평가되어 있다고 볼 수 있는 이유는?",
@@ -88,13 +101,10 @@ OX_PROMPT = ChatPromptTemplate.from_template("""
 조건:
 - 주제: {topic}
 - 난이도: {level} ({level_guide})
-- 문제는 반드시 한 문장으로 짧고 명확하게 작성하세요.
-- 사용자 수준에 맞는 쉬운 용어만 사용하세요.
-- 문제·해설의 모든 텍스트는 한국어로 작성하세요.
-- 실제로 존재하는 개념·용어만 사용하고, 존재하지 않는 용어를 지어내지 마세요.
-- 정답(answer)과 해설이 서로 모순되지 않아야 하며, 해설은 왜 그 답이 맞는지 설명하세요.
-- 반드시 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
-
+""" + QUALITY_RULES + """
+""" + OX_QUALITY_RULES + """
+- 해설은 왜 그 답이 맞는지 설명하세요.
+""" + ANGLE_BLOCK + """
 JSON 형식:
 {{
   "question_text": "문제 내용",
@@ -105,47 +115,6 @@ JSON 형식:
 """)
 
 
-def _get_llm() -> ChatOllama:
-    return ChatOllama(
-        base_url=settings.OLLAMA_BASE_URL,
-        model=settings.LLM_MODEL,
-        temperature=0.7,  # 문제 다양성을 위해 높게
-        reasoning=False,
-        # 문제+선택지+해설 JSON이 중간에 잘리면 파싱 실패로 재시도를 소진하므로 출력 토큰 확보.
-        # num_ctx는 채팅 체인과 동일하게 맞춰 Ollama가 모델을 재로드(지연)하지 않게 한다.
-        num_predict=1024,
-        num_ctx=6144,
-    )
-
-
-def _extract_json(text: str) -> dict:
-    """LLM 응답에서 JSON 추출.
-
-    코드펜스만 제거하던 기존 방식은 LLM이 JSON 앞뒤에 설명 문장을 붙이면 곧바로 실패해
-    재시도 3회를 소진하고 500이 나기 쉬웠다. 그래서 먼저 통짜 파싱을 시도하고, 실패하면
-    첫 번째 균형 잡힌 중괄호 블록 `{...}`을 찾아 파싱한다.
-    """
-    text = re.sub(r"```json|```", "", text).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    start = text.find("{")
-    if start == -1:
-        raise ValueError("응답에서 JSON 객체를 찾지 못함")
-
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(text[start:i + 1])
-    raise ValueError("응답의 JSON 중괄호가 닫히지 않음")
-
-
 def _get_random_topic(quiz_type: str) -> str:
     import random
     if quiz_type == "OX":
@@ -153,7 +122,9 @@ def _get_random_topic(quiz_type: str) -> str:
     return random.choice(MC_TOPICS)
 
 
-async def generate_ox_question(user: UserContext, topic: str) -> dict:
+async def generate_ox_question(
+    user: UserContext, topic: str, angle: str = "", avoid: list[str] | None = None,
+) -> dict:
     level_guide = LEVEL_GUIDE.get(user.investment_level, LEVEL_GUIDE["미설정"])
     chain = OX_PROMPT | _get_llm()
 
@@ -163,13 +134,12 @@ async def generate_ox_question(user: UserContext, topic: str) -> dict:
                 "topic": topic,
                 "level": user.investment_level,
                 "level_guide": level_guide,
+                "angle": angle or angle_for(0),
+                "avoid_block": format_avoid_block(avoid or []),
             })
             data = _extract_json(response.content)
 
-            # 필수 필드 검증
-            assert "question_text" in data
-            assert "answer" in data and data["answer"] in ["O", "X"]
-            assert "explanation" in data
+            check_ox_question(data)
 
             return {
                 "question_type": "OX",
@@ -188,7 +158,9 @@ async def generate_ox_question(user: UserContext, topic: str) -> dict:
             continue
 
 
-async def generate_mc_question(user: UserContext, topic: str) -> dict:
+async def generate_mc_question(
+    user: UserContext, topic: str, angle: str = "", avoid: list[str] | None = None,
+) -> dict:
     level_guide = LEVEL_GUIDE.get(user.investment_level, LEVEL_GUIDE["미설정"])
     chain = MC_PROMPT | _get_llm()
 
@@ -198,18 +170,12 @@ async def generate_mc_question(user: UserContext, topic: str) -> dict:
                 "topic": topic,
                 "level": user.investment_level,
                 "level_guide": level_guide,
+                "angle": angle or angle_for(0),
+                "avoid_block": format_avoid_block(avoid or []),
             })
             data = _extract_json(response.content)
 
-            # 필수 필드 검증
-            assert "question_text" in data
-            assert "choices" in data and len(data["choices"]) == 4
-            assert "correct_no" in data and 1 <= data["correct_no"] <= 4
-            assert "explanation" in data
-            # 선택지 번호가 1~4로 중복 없이 존재하고 정답 번호가 그 안에 있는지 검증.
-            # (LLM이 no를 중복/누락하면 is_correct 매핑이 깨지므로 여기서 걸러 재시도한다)
-            nos = sorted(c["no"] for c in data["choices"])
-            assert nos == [1, 2, 3, 4], f"선택지 번호 이상: {nos}"
+            check_mc_question(data)
 
             choices = [
                 {
@@ -234,14 +200,23 @@ async def generate_mc_question(user: UserContext, topic: str) -> dict:
             continue
 
 
-async def generate_quiz(user: UserContext, quiz_type: str, topic: str = None) -> dict:
+async def generate_quiz(
+    user: UserContext, quiz_type: str, topic: str = None,
+    angle: str = "", avoid: list[str] | None = None,
+) -> dict:
+    """문제 1개 생성.
+
+    angle/avoid는 같은 주제로 여러 문제를 만들 때 중복을 막기 위한 것이다.
+    (angle = 이번 문제의 출제 방향, avoid = 이미 만든 문제 목록)
+    생략하면 첫 번째 관점을 쓴다 - 단건 생성에서는 중복 걱정이 없다.
+    """
     if not topic:
         topic = _get_random_topic(quiz_type)
 
     if quiz_type == "OX":
-        return await generate_ox_question(user, topic)
+        return await generate_ox_question(user, topic, angle, avoid)
     elif quiz_type == "MULTIPLE_CHOICE":
-        return await generate_mc_question(user, topic)
+        return await generate_mc_question(user, topic, angle, avoid)
     else:
         raise ValueError(f"지원하지 않는 문제 유형: {quiz_type}")
 
@@ -259,16 +234,69 @@ async def generate_quiz_batch(user: UserContext, quiz_type: str, topic: str = No
         topic = _get_random_topic(quiz_type)
 
     questions: list[dict] = []
-    seen_texts: set[str] = set()
+    seen_texts: list[str] = []
+    gen_args: list[tuple] = []
 
-    for _ in range(count):
-        question = await generate_quiz(user, quiz_type, topic)
-        if question["question_text"] in seen_texts:
-            question = await generate_quiz(user, quiz_type, topic)  # 중복이면 1회 재시도
-        seen_texts.add(question["question_text"])
+    # 과거에 이 주제로 만든 문제 수만큼 관점을 밀어, 재요청 시 다른 관점부터 시작한다
+    offset = await bank.angle_offset(topic, user.user_id)
+
+    for i in range(count):
+        # 같은 topic이 반복되므로 문제마다 출제 관점을 돌려 중복을 막는다.
+        # 이미 만든 문제도 프롬프트에 넘겨 같은 내용을 피하게 한다.
+        angle = angle_for(offset + i)
+        question = await generate_quiz(user, quiz_type, topic, angle, seen_texts)
+        # 세트 안 중복(문자 유사도) + 과거 요청과의 중복(임베딩 유사도)
+        if await _is_duplicate(question["question_text"], seen_texts, user):
+            question = await generate_quiz(user, quiz_type, topic, angle, seen_texts)
+        seen_texts.append(question["question_text"])
         questions.append(question)
+        gen_args.append((quiz_type, topic, angle, list(seen_texts)))
 
+    await _revalidate_and_fix(questions, gen_args, user)
+    # 검증·재생성이 끝난 확정본만 저장한다
+    await bank.register(questions, user.user_id)
     return questions
+
+
+async def _is_duplicate(text: str, seen_texts: list[str], user: UserContext) -> bool:
+    """세트 안 중복(무료) 먼저 보고, 통과하면 과거 문제와 대조한다.
+
+    문자 유사도가 먼저인 이유는 비용이 0이기 때문이다.
+    여기서 걸리면 Qdrant 호출 자체를 아낀다.
+    """
+    if is_near_duplicate(text, seen_texts):
+        logger.info(f"세트 내 중복 감지 - 재생성: {text[:40]}")
+        return True
+    return await bank.is_duplicate_of_past(text, user.user_id)
+
+
+async def _revalidate_and_fix(
+    questions: list[dict], gen_args: list[tuple], user: UserContext,
+) -> None:
+    """정답/해설이 모순된 문제를 찾아 같은 조건으로 1회 재생성한다 (in-place 수정).
+
+    세트 전체를 LLM 1회 호출로 검사한다. 재생성본은 다시 검증하지 않는다
+    (검증 호출이 계속 늘어나는 것을 막기 위한 타협).
+    """
+    failed = await validate_questions(questions)
+    if not failed:
+        logger.info("문제 검증 통과 (전체 합격)")
+        return
+
+    logger.warning(f"검증 불합격 {len(failed)}건 - 재생성: {list(failed.values())}")
+    for idx, _reason in failed.items():
+        quiz_type, topic, angle, avoid = gen_args[idx]
+        try:
+            fixed = await generate_quiz(user, quiz_type, topic, angle, avoid)
+        except ValueError as e:
+            # 재생성 실패 시 원본 유지 - 문제 개수는 항상 맞춰야 한다
+            logger.warning(f"{idx + 1}번 재생성 실패 - 원본 유지: {e}")
+            continue
+        # 카테고리 매핑 등 생성 이후 붙은 필드는 원본 것을 승계한다
+        for field in ("category_code", "detail_codes", "primary_detail_code"):
+            if field in questions[idx]:
+                fixed[field] = questions[idx][field]
+        questions[idx] = fixed
 
 
 # =========================================================
@@ -345,6 +373,10 @@ MAP_TOPICS_PROMPT = ChatPromptTemplate.from_template("""
 규칙:
 - 각 주제마다 가장 잘 맞는 카테고리의 category_code 1개와
   관련된 detail_codes(보통 1개)를 고르세요.
+- **같은 개념이 여러 등급에 걸쳐 있으면 반드시 "{preferred_level}" 등급을 먼저 고르세요.**
+  (예: 사용자가 초급인데 "배당수익률" 주제라면, 중급의 "배당 공시"가 아니라
+   초급의 "배당"을 선택해야 합니다. 등급을 올려 잡으면 안 됩니다)
+  해당 등급에 정말 맞는 것이 없을 때만 다른 등급을 고르세요.
 - 목록에 있는 code만 사용하세요. 맞는 것이 없으면 category_code를 null로 하세요.
 - topic은 주제 목록의 문자열을 그대로 사용하세요.
 - 반드시 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
@@ -356,6 +388,41 @@ JSON 형식:
   ]
 }}
 """)
+
+
+# 프롬프트에서 문제 유형 의도를 읽어내는 패턴.
+# 분석 LLM이 "OX 3개 내줘"에도 객관식을 섞어 내는 경우가 있어(실측)
+# 계획 단계 결과를 코드로 한 번 더 강제한다.
+# \bOX\b 를 쓰면 "OX로", "OX만" 처럼 조사가 붙었을 때 매칭되지 않는다
+# (한글도 \w 라서 단어 경계가 생기지 않음). 앞뒤 영문자만 배제한다.
+_OX_MENTION = re.compile(r"(?<![A-Za-z])OX(?![A-Za-z])|O/X|오엑스|오·엑스", re.IGNORECASE)
+_MIX_MENTION = re.compile(r"섞|혼합|골고루|반반")
+
+
+def _enforce_question_type(prompt: str, items: list[dict]) -> list[dict]:
+    """출제 계획의 문제 유형을 사용자 의도에 맞춰 통일한다.
+
+    - "섞어서" 류 요청이면 그대로 둔다 (혼합이 의도된 경우).
+    - 프롬프트에 OX가 명시되면 전부 OX로 강제한다.
+    - 그 외에 유형이 섞여 나왔으면 전부 객관식으로 통일한다
+      (유형 언급이 없으면 객관식이 기본이라는 기존 정책과 일치).
+    """
+    if not items or _MIX_MENTION.search(prompt):
+        return items
+
+    if _OX_MENTION.search(prompt):
+        forced = "OX"
+    elif len({item["question_type"] for item in items}) > 1:
+        forced = "MULTIPLE_CHOICE"
+    else:
+        return items
+
+    changed = sum(1 for item in items if item["question_type"] != forced)
+    if changed:
+        logger.info(f"문제 유형 통일: {changed}개 항목을 {forced}로 보정")
+    for item in items:
+        item["question_type"] = forced
+    return items
 
 
 def _format_catalog(categories: list[QuizCategoryIn]) -> str:
@@ -463,7 +530,9 @@ async def _analyze_once(prompt: str, categories: list[QuizCategoryIn]) -> list[d
     return items[:count]
 
 
-async def _map_topics_to_catalog(topics: list[str], categories: list[QuizCategoryIn]) -> dict[str, dict]:
+async def _map_topics_to_catalog(
+    topics: list[str], categories: list[QuizCategoryIn], preferred_level: str = "초급",
+) -> dict[str, dict]:
     """주제 목록을 카탈로그에 매핑한다. {topic: {"category_code", "detail_codes"}} 반환.
 
     실패해도 예외를 던지지 않고 빈 dict를 반환한다 — 매핑은 부가 정보라
@@ -476,6 +545,7 @@ async def _map_topics_to_catalog(topics: list[str], categories: list[QuizCategor
             response = await chain.ainvoke({
                 "topics": "\n".join(f"- {t}" for t in topics),
                 "catalog": _format_catalog(categories),
+                "preferred_level": preferred_level,
             })
             data = _extract_json(response.content)
             break
@@ -526,12 +596,18 @@ async def analyze_quiz_prompt(prompt: str, investment_level: str = "미설정") 
 
     level_catalog = get_catalog_for_level(investment_level)
     items = await _analyze_once(prompt, level_catalog)
+    # 분석 LLM이 유형을 섞어 내는 경우가 있어 사용자 의도대로 통일한다
+    items = _enforce_question_type(prompt, items)
 
     unmapped = [item for item in items if item["category_code"] is None]
     if unmapped and len(level_catalog) != len(QUIZ_CATEGORY_CATALOG):
         topics = list(dict.fromkeys(item["topic"] for item in unmapped))
         logger.info(f"등급({investment_level}) 밖 주제 재매핑 시도: {topics}")
-        mappings = await _map_topics_to_catalog(topics, QUIZ_CATEGORY_CATALOG)
+        # 입문 유저는 초급 카테고리를 쓰므로 그에 맞춰 선호 등급을 정한다
+        preferred = "초급" if investment_level in ("입문", "미설정") else investment_level
+        mappings = await _map_topics_to_catalog(
+            topics, QUIZ_CATEGORY_CATALOG, preferred_level=preferred,
+        )
         for item in unmapped:
             mapping = mappings.get(item["topic"])
             if mapping:
@@ -555,17 +631,32 @@ async def generate_quiz_from_prompt(prompt: str, user: UserContext) -> list[dict
     )
 
     questions: list[dict] = []
-    seen_texts: set[str] = set()
+    seen_texts: list[str] = []
+    gen_args: list[tuple] = []
+    # 같은 주제가 여러 항목에 걸쳐 나오므로 주제별로 출제 관점을 돌린다
+    # (관점 없이 돌리면 "배당수익률 = 배당금/주가" 하나를 표현만 바꿔 반복함 - 실측)
+    topic_slot: dict[str, int] = defaultdict(int)
+    # 주제별로 과거 생성 이력만큼 관점을 밀어둔다 (재요청 시 중복 방지)
+    for t in {item["topic"] for item in plan}:
+        topic_slot[t] = await bank.angle_offset(t, user.user_id)
 
     for item in plan:
-        question = await generate_quiz(user, item["question_type"], item["topic"])
-        if question["question_text"] in seen_texts:
-            question = await generate_quiz(user, item["question_type"], item["topic"])
-        seen_texts.add(question["question_text"])
+        topic = item["topic"]
+        angle = angle_for(topic_slot[topic])
+        topic_slot[topic] += 1
+
+        question = await generate_quiz(user, item["question_type"], topic, angle, seen_texts)
+        # 세트 안 중복(문자 유사도) + 과거 요청과의 중복(임베딩 유사도)
+        if await _is_duplicate(question["question_text"], seen_texts, user):
+            question = await generate_quiz(user, item["question_type"], topic, angle, seen_texts)
+        seen_texts.append(question["question_text"])
 
         question["category_code"] = item["category_code"]
         question["detail_codes"] = item["detail_codes"]
         question["primary_detail_code"] = item["detail_codes"][0] if item["detail_codes"] else None
         questions.append(question)
+        gen_args.append((item["question_type"], topic, angle, list(seen_texts)))
 
+    await _revalidate_and_fix(questions, gen_args, user)
+    await bank.register(questions, user.user_id)
     return questions
