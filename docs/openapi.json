@@ -203,7 +203,7 @@
           "quiz"
         ],
         "summary": "프롬프트 기반 AI 퀴즈 문제 생성",
-        "description": "사용자가 입력한 자유 프롬프트를 AI가 분석해 주제를 파악하고 퀴즈 문제를 생성합니다.\n\n**동작 방식 (2단계)**\n\n1. 분석: 프롬프트에서 출제 주제·문제 개수·문제 유형을 파악하고,\n   요청으로 받은 카테고리/상세 코드 목록에 매핑한 출제 계획을 세웁니다.\n2. 생성: 계획의 각 항목을 순차적으로 실제 문제로 생성합니다.\n\n**문제 개수**\n- 프롬프트에 개수가 명시되면 그 개수로 생성 (예: \"PER 문제 3개 만들어줘\" → 3개)\n- 명시가 없으면 기본 5개\n- 최대 10개 (초과 요청 시 10개로 제한 — 순차 생성이라 개수에 비례해 느려짐)\n\n**여러 주제**\n- 프롬프트에 여러 주제가 있으면 주제별로 고르게 나눠 생성합니다.\n  (예: \"PER이랑 분산투자 문제 내줘\" → PER/분산투자 문제 혼합)\n\n**문제 유형**\n- 프롬프트에서 파악: \"OX로 내줘\" → OX, \"객관식으로\" → 4지선다, 언급 없으면 객관식\n- \"섞어서 내줘\" 같은 요청이면 문제별로 유형이 다를 수 있습니다.\n\n**카테고리 매핑 (응답 필드)**\n- 문제마다 `category_code`(1개)와 `detail_codes`(관련 상세 코드 목록)를 반환합니다.\n- `primary_detail_code`: 대표 상세 코드 (`quiz_question_details.is_primary=TRUE` 저장용)\n- 카테고리/상세 코드 목록은 AI 서버에 내장되어 있습니다 (DB `quiz_categories` /\n  `quiz_category_details` 초기 데이터의 미러 — `app/services/quiz/categories.py`).\n  ⚠️ DB에서 카테고리를 추가/수정하면 이 파일도 같이 수정해야 합니다.\n- 내장 목록에 존재하는 코드만 반환합니다 (AI가 지어낸 코드는 검증 단계에서 제거).\n- 적합한 카테고리가 없으면 `category_code`는 null, `detail_codes`는 빈 배열일 수 있습니다.\n- NestJS는 코드로 category_id/detail_id를 조회해 `quiz_questions`,\n  `quiz_question_details`, `quiz_choices`에 저장하면 됩니다.\n\n**주의사항**\n- LLM 생성 특성상 문제 1개당 최대 3회 재시도, 실패 시 500 에러\n- 순차 생성이라 응답 시간은 문제 개수에 비례합니다 (1개당 수 초)",
+        "description": "사용자가 입력한 자유 프롬프트를 AI가 분석해 주제를 파악하고 퀴즈 문제를 생성합니다.\n\n**동작 방식 (2단계)**\n\n1. 분석: 프롬프트에서 출제 주제·문제 개수·문제 유형을 파악하고,\n   요청으로 받은 카테고리/상세 코드 목록에 매핑한 출제 계획을 세웁니다.\n2. 생성: 계획의 각 항목을 순차적으로 실제 문제로 생성합니다.\n\n**문제 개수**\n- 프롬프트에 개수가 명시되면 그 개수로 생성 (예: \"PER 문제 3개 만들어줘\" → 3개)\n- 명시가 없으면 기본 5개\n- 최대 10개 (초과 요청 시 10개로 제한 — 순차 생성이라 개수에 비례해 느려짐)\n\n**여러 주제**\n- 프롬프트에 여러 주제가 있으면 주제별로 고르게 나눠 생성합니다.\n  (예: \"PER이랑 분산투자 문제 내줘\" → PER/분산투자 문제 혼합)\n\n**문제 유형**\n- 프롬프트에서 파악: \"OX로 내줘\" → OX, 언급 없으면 전부 객관식(4지선다)\n- \"섞어서 내줘\" 같은 요청이면 문제별로 유형이 다를 수 있습니다.\n\n**카테고리 등급 필터링**\n- 카테고리 매핑 시 사용자의 investment_level과 같은 등급의 카테고리를 우선 사용합니다.\n  (초급 유저의 문제가 불필요하게 중급/고급 카테고리로 분류되지 않도록)\n- 입문 유저는 초급 카테고리를 사용합니다 (DB에 입문용 카테고리가 없음).\n- 미설정 유저는 전체 카테고리를 사용합니다.\n- 유저 등급에 없는 주제도 문제 생성이 가능합니다: 예를 들어 초급 유저가\n  \"볼린저밴드 문제\"를 요청하면, 해당 주제만 전체 카테고리 대상으로 재매핑해\n  다른 등급의 category_code(예: INTERMEDIATE_INDICATOR_CONCEPT)로 반환합니다.\n  이때 문제 난이도는 여전히 사용자 수준(초급)에 맞춰 조절됩니다.\n\n**카테고리 매핑 (응답 필드)**\n- 문제마다 `category_code`(1개)와 `detail_codes`(관련 상세 코드 목록)를 반환합니다.\n- `primary_detail_code`: 대표 상세 코드 (`quiz_question_details.is_primary=TRUE` 저장용)\n- 카테고리/상세 코드 목록은 AI 서버에 내장되어 있습니다 (DB `quiz_categories` /\n  `quiz_category_details` 초기 데이터의 미러 — `app/services/quiz/categories.py`).\n  ⚠️ DB에서 카테고리를 추가/수정하면 이 파일도 같이 수정해야 합니다.\n- 내장 목록에 존재하는 코드만 반환합니다 (AI가 지어낸 코드는 검증 단계에서 제거).\n- 적합한 카테고리가 없으면 `category_code`는 null, `detail_codes`는 빈 배열일 수 있습니다.\n- NestJS는 코드로 category_id/detail_id를 조회해 `quiz_questions`,\n  `quiz_question_details`, `quiz_choices`에 저장하면 됩니다.\n\n**주의사항**\n- LLM 생성 특성상 문제 1개당 최대 3회 재시도, 실패 시 500 에러\n- 순차 생성이라 응답 시간은 문제 개수에 비례합니다 (1개당 수 초)",
         "operationId": "generate_from_prompt_quiz_generate_prompt_post",
         "requestBody": {
           "content": {
@@ -305,6 +305,89 @@
               "application/json": {
                 "example": {
                   "detail": "프롬프트에서 퀴즈 주제를 파악할 수 없습니다."
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "문제 생성 실패 (LLM 재시도 초과)"
+          }
+        }
+      }
+    },
+    "/quiz/generate/review": {
+      "post": {
+        "tags": [
+          "quiz"
+        ],
+        "summary": "오답 기반 AI 퀴즈 문제 생성",
+        "description": "사용자가 그동안 틀린 문제들을 받아, 자주 틀린 주제 위주로 새 문제 5개를 생성합니다.\n\n**동작 방식**\n\n1. 받은 오답들을 주제별로 묶습니다 (`detail_code` 우선, 없으면 `topic`).\n2. 많이 틀린 주제 순으로 정렬한 뒤 5개 슬롯을 배분합니다.\n   많이 틀린 주제가 더 많은 문제를 가져갑니다 (주제 2개면 3:2).\n3. 슬롯마다 해당 주제의 실제 오답을 프롬프트에 넣어 문제를 생성합니다.\n   같은 개념은 유지하고 종목·수치·상황만 바꾸며, 유저가 골랐던 오답의\n   오해를 선택지로 재배치하고 해설에서 짚어줍니다.\n4. 생성된 문제 전체를 한 번에 검증합니다 (정답/해설 모순, 지표 정의 오류,\n   OX 이중부정 등). 불합격 문제만 같은 조건으로 1회 재생성합니다.\n\n**같은 주제에 여러 문제가 배정될 때**\n\n슬롯마다 출제 관점을 강제로 돌립니다 (정의·계산 → 흔한 오해 → 함께 볼 지표\n→ 실제 적용 → 예외 상황). 같은 주제에서 사실상 같은 문제가 반복되는 것을 막습니다.\n\n**문제 개수**\n- 항상 5개 고정입니다 (요청으로 조절 불가).\n\n**NestJS가 보낼 데이터**\n\n`quiz_attempts`에서 `WHERE user_id = ? AND is_correct = FALSE`로 조회한 오답을\n`quiz_questions` / `quiz_choices`와 조인해서 `wrong_answers` 배열에 담아주세요.\n\n- `detail_code` (권장): `quiz_question_details`에서 `is_primary = TRUE`인 행의\n  `quiz_category_details.detail_code`. 주제를 정확히 알 수 있어 품질이 크게 올라갑니다.\n  없으면 `topic` 문자열로 대체되고, 둘 다 없으면 문제 본문에서 추론합니다.\n- `selected_choice_no` (권장): 유저가 고른 오답 번호.\n  이게 있어야 \"무엇을 오해했는지\"를 겨냥한 문제가 나옵니다.\n  없으면 그냥 같은 주제의 평범한 문제가 생성됩니다.\n- 오답 개수 제한은 없지만, 주제당 최대 2개까지만 프롬프트에 사용합니다.\n\n**문제 유형**\n- 주제별로 틀린 문제의 유형을 다수결로 따릅니다.\n  (OX만 틀린 주제는 OX로, 그 외에는 객관식 4지선다)\n\n**응답 형태**\n- `/quiz/generate/prompt`와 **완전히 동일한 스키마**입니다.\n  NestJS는 기존 저장 로직(`category_code`/`detail_codes`/`primary_detail_code` →\n  `quiz_questions`, `quiz_question_details`, `quiz_choices`)을 그대로 재사용하면 됩니다.\n- 저장 시 `source_type='WRONG_ANSWER'`, `visibility='PRIVATE'`,\n  `owner_user_id`=요청 유저로 넣으면 됩니다.\n- ⚠️ AI 생성 문제에는 `reward_cash`를 넣지 마세요. 보상 현금이 모의투자 총자산 →\n  랭킹 수익률로 이어져서, 문제를 반복 생성하면 거래 없이 수익률을 올릴 수 있습니다.\n\n**주의사항**\n- LLM 생성 특성상 문제 1개당 최대 3회 재시도, 실패 시 500 에러\n- 순차 생성이라 응답 시간이 깁니다. LLM 호출은 최소 6회\n  (생성 5 + 검증 1)이며, 중복·검증 불합격 시 더 늘어납니다.\n  `detail_code`를 보내면 카테고리 매핑 호출 1회를 아낄 수 있습니다.\n  프론트에 로딩 처리가 필요합니다.",
+        "operationId": "generate_from_wrong_answers_quiz_generate_review_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewQuizGenerateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "문제 생성 성공",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewQuizGenerateResponse"
+                },
+                "example": {
+                  "questions": [
+                    {
+                      "question_type": "MULTIPLE_CHOICE",
+                      "question_text": "업종 평균보다 PER이 낮은 기업을 평가할 때 함께 확인해야 하는 것은?",
+                      "choices": [
+                        {
+                          "choice_no": 1,
+                          "text": "PER이 낮으면 무조건 저평가이므로 확인할 필요가 없다",
+                          "is_correct": false
+                        },
+                        {
+                          "choice_no": 2,
+                          "text": "성장성과 일회성 이익 여부",
+                          "is_correct": true
+                        },
+                        {
+                          "choice_no": 3,
+                          "text": "거래량이 많은지 여부",
+                          "is_correct": false
+                        },
+                        {
+                          "choice_no": 4,
+                          "text": "상장 시기가 언제인지",
+                          "is_correct": false
+                        }
+                      ],
+                      "explanation": "PER이 낮다는 것만으로 저평가라고 볼 수 없습니다. 성장성이 낮거나 일회성 이익으로 순이익이 부풀려진 경우에도 PER은 낮게 나옵니다.",
+                      "topic": "PER",
+                      "level": "초급",
+                      "category_code": "BEGINNER_FINANCIAL_BASIC",
+                      "detail_codes": [
+                        "PER_BASIC"
+                      ],
+                      "primary_detail_code": "PER_BASIC"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "오답 데이터가 비어 있음",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "오답 데이터가 없습니다."
                 }
               }
             }
@@ -721,6 +804,43 @@
         ],
         "title": "QuizGenerateResponse"
       },
+      "ReviewQuizGenerateRequest": {
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/UserContext"
+          },
+          "wrong_answers": {
+            "items": {
+              "$ref": "#/components/schemas/WrongAnswerItem"
+            },
+            "type": "array",
+            "title": "Wrong Answers"
+          }
+        },
+        "type": "object",
+        "required": [
+          "user",
+          "wrong_answers"
+        ],
+        "title": "ReviewQuizGenerateRequest"
+      },
+      "ReviewQuizGenerateResponse": {
+        "properties": {
+          "questions": {
+            "items": {
+              "$ref": "#/components/schemas/PromptQuizQuestion"
+            },
+            "type": "array",
+            "title": "Questions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "questions"
+        ],
+        "title": "ReviewQuizGenerateResponse",
+        "description": "응답 형태는 PromptQuizQuestion과 동일하다.\n\nNestJS 입장에서 /quiz/generate/prompt 와 저장 로직을 그대로 공유할 수 있게\n의도적으로 같은 스키마를 사용한다 (category_code/detail_codes/primary_detail_code)."
+      },
       "UserContext": {
         "properties": {
           "user_id": {
@@ -778,6 +898,100 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "WrongAnswerChoice": {
+        "properties": {
+          "choice_no": {
+            "type": "integer",
+            "title": "Choice No"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "is_correct": {
+            "type": "boolean",
+            "title": "Is Correct",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "choice_no",
+          "text"
+        ],
+        "title": "WrongAnswerChoice"
+      },
+      "WrongAnswerItem": {
+        "properties": {
+          "question_text": {
+            "type": "string",
+            "title": "Question Text"
+          },
+          "question_type": {
+            "type": "string",
+            "title": "Question Type",
+            "default": "MULTIPLE_CHOICE"
+          },
+          "explanation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Explanation"
+          },
+          "topic": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topic"
+          },
+          "detail_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail Code"
+          },
+          "choices": {
+            "items": {
+              "$ref": "#/components/schemas/WrongAnswerChoice"
+            },
+            "type": "array",
+            "title": "Choices",
+            "default": []
+          },
+          "selected_choice_no": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Choice No"
+          }
+        },
+        "type": "object",
+        "required": [
+          "question_text"
+        ],
+        "title": "WrongAnswerItem",
+        "description": "유저가 틀린 문제 1개 (quiz_attempts + quiz_questions + quiz_choices 조인 결과).\n\nNestJS는 `WHERE user_id = ? AND is_correct = FALSE` 로 조회한 오답들을\n이 형태로 담아 보내면 된다.\n\ndetail_code는 quiz_question_details(is_primary=TRUE) → quiz_category_details.detail_code.\n이 값이 있으면 주제를 정확히 알 수 있어 생성 품질이 크게 올라간다.\n없으면 topic 문자열로 대체하고, 둘 다 없으면 문제 본문에서 주제를 추론한다."
       }
     }
   }
