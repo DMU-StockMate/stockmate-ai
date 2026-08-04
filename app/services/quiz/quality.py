@@ -24,7 +24,7 @@ import json
 import re
 
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama
+from app.core.llm import build_llm
 
 from app.core.config import settings
 from app.core.logger import setup_logger
@@ -36,17 +36,9 @@ logger = setup_logger(__name__)
 # LLM 헬퍼
 # =========================================================
 
-def get_llm() -> ChatOllama:
-    return ChatOllama(
-        base_url=settings.OLLAMA_BASE_URL,
-        model=settings.LLM_MODEL,
-        temperature=0.7,  # 문제 다양성을 위해 높게
-        reasoning=False,
-        # 문제+선택지+해설 JSON이 중간에 잘리면 파싱 실패로 재시도를 소진하므로 출력 토큰 확보.
-        # num_ctx는 채팅 체인과 동일하게 맞춰 Ollama가 모델을 재로드(지연)하지 않게 한다.
-        num_predict=1024,
-        num_ctx=6144,
-    )
+def get_llm():
+    """퀴즈 생성용 LLM (temperature 0.7 - 문제 다양성을 위해 높게)."""
+    return build_llm(temperature=0.7)
 
 
 def extract_json(text: str) -> dict:

@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta
-from langchain_ollama import ChatOllama
+from app.core.llm import build_llm
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage
@@ -105,20 +105,9 @@ QUIZ_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
-def _get_llm() -> ChatOllama:
-    return ChatOllama(
-        base_url=settings.OLLAMA_BASE_URL,
-        model=settings.LLM_MODEL,
-        temperature=0.3,
-        reasoning=False,
-        # num_predict: 출력 최대 토큰. 미지정 시 Modelfile 기본값에 걸려 답변이 단어 중간에
-        #   잘리는 현상이 있었다(예: 공시 제목 인용 중 절단). 넉넉히 확보해 완결된 답변 보장.
-        # num_ctx: 컨텍스트 창. RAG 프롬프트(시세+뉴스/공시 여러 건+재무+히스토리)를 담아야 해서
-        #   6144로 확장 — 공시를 여러 건(dart take=5) 본문과 함께 넣어 자세한 답변을 유도한다.
-        #   (RTX 4060 Ti 8GB에서 9B 모델 기준 대체로 안전. OOM 시 4096으로 낮출 것)
-        num_predict=1024,
-        num_ctx=6144,
-    )
+def _get_llm():
+    """RAG 답변용 LLM (temperature 0.3 - 사실 기반이라 낮게)."""
+    return build_llm(temperature=0.3, num_predict=1024, num_ctx=6144)
 
 
 def _convert_history(history: list[Message]) -> list:

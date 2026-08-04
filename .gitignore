@@ -1,4 +1,4 @@
-﻿.venv/
+.venv/
 __pycache__/
 *.pyc
 .env
@@ -10,3 +10,7 @@ __pycache__/
 lora_weights/
 data/
 chroma_storage/
+
+# 로컬 백업 / 비교 실험 산출물
+*.bak
+compare_out/

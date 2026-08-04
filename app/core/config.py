@@ -3,6 +3,17 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     LLM_MODEL: str = "qwen3.5:9b"
+    # LLM 백엔드 전환 (ollama | openai)
+    #   ollama : Ollama 서버 (기존). OLLAMA_BASE_URL + LLM_MODEL 사용
+    #   openai : OpenAI 호환 서버(llama.cpp llama-server 등). LLM_BASE_URL + LLM_MODEL 사용
+    # llama-server 예시:
+    #   llama-server.exe -m <gguf> -ngl 999 --n-cpu-moe 34 --flash-attn on -c 16384 --port 8080
+    #   LLM_BACKEND=openai / LLM_BASE_URL=http://127.0.0.1:8080/v1
+    LLM_BACKEND: str = "ollama"
+    LLM_BASE_URL: str = "http://127.0.0.1:8080/v1"
+    LLM_API_KEY: str = "no-key"
+    # openai 백엔드에서 thinking 비활성화 (Qwen3.5/3.6 채팅 템플릿 인자)
+    LLM_DISABLE_THINKING: bool = True
     
     # Qdrant
     QDRANT_HOST: str = "localhost"
