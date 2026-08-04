@@ -2,6 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "StockMate AI",
+    "description": "StockMate AI 마이크로서비스.\n\n**인증**: `/health` 를 제외한 모든 엔드포인트는 `X-API-Key` 헤더가 필요합니다.\n(`Authorization: Bearer <키>` 형식도 허용)\n\n서버의 `AI_API_KEY` 환경변수가 비어 있으면 인증이 비활성화됩니다(로컬 개발용).",
     "version": "0.1.0"
   },
   "paths": {
@@ -44,8 +45,23 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "API 키가 없거나 일치하지 않음",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "유효한 API 키가 필요합니다. X-API-Key 헤더를 확인하세요."
+                }
+              }
+            }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/chat/evaluate": {
@@ -84,8 +100,23 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "API 키가 없거나 일치하지 않음",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "유효한 API 키가 필요합니다. X-API-Key 헤더를 확인하세요."
+                }
+              }
+            }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/quiz/generate": {
@@ -193,8 +224,23 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "API 키가 없거나 일치하지 않음",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "유효한 API 키가 필요합니다. X-API-Key 헤더를 확인하세요."
+                }
+              }
+            }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/quiz/generate/prompt": {
@@ -311,8 +357,23 @@
           },
           "500": {
             "description": "문제 생성 실패 (LLM 재시도 초과)"
+          },
+          "401": {
+            "description": "API 키가 없거나 일치하지 않음",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "유효한 API 키가 필요합니다. X-API-Key 헤더를 확인하세요."
+                }
+              }
+            }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/quiz/generate/review": {
@@ -394,8 +455,23 @@
           },
           "500": {
             "description": "문제 생성 실패 (LLM 재시도 초과)"
+          },
+          "401": {
+            "description": "API 키가 없거나 일치하지 않음",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "유효한 API 키가 필요합니다. X-API-Key 헤더를 확인하세요."
+                }
+              }
+            }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/health": {
@@ -992,6 +1068,14 @@
         ],
         "title": "WrongAnswerItem",
         "description": "유저가 틀린 문제 1개 (quiz_attempts + quiz_questions + quiz_choices 조인 결과).\n\nNestJS는 `WHERE user_id = ? AND is_correct = FALSE` 로 조회한 오답들을\n이 형태로 담아 보내면 된다.\n\ndetail_code는 quiz_question_details(is_primary=TRUE) → quiz_category_details.detail_code.\n이 값이 있으면 주제를 정확히 알 수 있어 생성 품질이 크게 올라간다.\n없으면 topic 문자열로 대체하고, 둘 다 없으면 문제 본문에서 주제를 추론한다."
+      }
+    },
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "팀 공유 API 키. 백엔드 .env 의 AI_API_KEY 값을 그대로 보낸다."
       }
     }
   }

@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = "no-key"
     # openai 백엔드에서 thinking 비활성화 (Qwen3.5/3.6 채팅 템플릿 인자)
     LLM_DISABLE_THINKING: bool = True
+    # 이 AI 서버 자체의 인증 키 (외부 노출 시 필수)
+    # 비워두면 인증을 끈다 - 로컬 개발용. 포트포워딩할 때는 반드시 채울 것.
+    AI_API_KEY: str = ""
     
     # Qdrant
     QDRANT_HOST: str = "localhost"
@@ -29,7 +32,7 @@ class Settings(BaseSettings):
     #   0.80 해석 관점 vs 정의 관점                                  -> 중복 아님
     # 0.90은 거의 같은 문장만 잡아 실질적으로 무용했다. 0.83이 중복만 걸러낸다.
     QUIZ_DUP_THRESHOLD: float = 0.83
-    
+
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
     DART_API_KEY: str = ""
     NAVER_CLIENT_ID: str = ""
