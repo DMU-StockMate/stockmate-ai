@@ -40,7 +40,6 @@ def get_llm():
     """퀴즈 생성용 LLM (temperature 0.7 - 문제 다양성을 위해 높게)."""
     return build_llm(temperature=0.7)
 
-
 def extract_json(text: str) -> dict:
     """LLM 응답에서 JSON 추출.
 
@@ -86,6 +85,13 @@ QUALITY_RULES = """- 문제는 반드시 한 문장으로 짧고 명확하게 �
 - 문제가 묻는 방향과 해설이 설명하는 방향이 반드시 일치해야 합니다.
   ("PER이 낮아진 이유"를 물었으면 해설도 낮아지는 경우를 설명해야 하며,
    높아지는 경우를 설명하면 안 됩니다)
+- **지문이 묻는 주장과 정답의 주장이 반대여서는 안 됩니다.**
+  지문에서 "A해야 한다는 판단으로 옳은 것은"이라고 물으면
+  정답도 A를 지지하는 문장이어야 합니다.
+  (나쁜 예: 지문 "바로 매도해야 한다는 판단으로 옳은 것은?"
+   정답 "하루 하락만 보고 바로 매도할지 정했다고 말할 수는 없다"
+   — 정답이 지문을 부정해 문제가 성립하지 않습니다.
+   이럴 때는 지문을 "바로 매도하면 안 되는 이유는?"으로 바꿔 쓰세요)
 - 실제로 존재하는 개념·지표·용어만 사용하고, 존재하지 않는 용어를 지어내지 마세요.
   특히 지표의 정의를 정확히 쓰세요.
   (PER = 주가 / 주당순이익(EPS). "순이익률"이 아닙니다.
@@ -130,22 +136,25 @@ OX_QUALITY_RULES = """- question_text는 반드시 참/거짓을 판단할 수 �
 # LLM은 금지는 쉽게 무시하지만 "이번엔 계산식을 물어라" 같은 지시는 따른다.
 # 추상적인 명사구로 뒀을 때도 무시당해서, 명령문 + 필수 등장 요소로 적는다.
 # 슬롯 인덱스로 순환하므로 결정론적이다.
+# 주의: 관점 문구가 지표(PER, ROE)를 전제하면 "주식", "주가" 같은 일반 개념 주제에서
+# 모델이 억지로 지표를 끌어와 주제를 이탈한다(실측: 이탈률 18.6%).
+# 계산식·수치 왜곡처럼 지표에만 해당하는 표현은 조건부로 적는다.
 GENERATION_ANGLES = [
-    "이 개념의 정의나 계산식 자체를 정확히 알고 있는지 묻는 문제를 만드세요. "
-    "'무엇으로 나눈 값인가', '어떻게 계산하는가' 같은 형태가 좋습니다.",
+    "이 개념이 무엇인지 정확히 알고 있는지 묻는 문제를 만드세요. "
+    "정의, 구성 요소, 계산식이 있는 개념이라면 계산 방법을 물어도 좋습니다. "
+    "계산식이 없는 개념이라면 정의와 특징에 집중하세요.",
 
-    "이 개념을 해석할 때 흔히 저지르는 오해를 바로잡는 문제를 만드세요.",
+    "이 개념을 이해할 때 흔히 저지르는 오해를 바로잡는 문제를 만드세요.",
 
     "이 개념 하나만 보고 판단하면 안 되는 이유를 다루는 문제를 만드세요. "
-    "같은 업종의 평균과 비교해야 한다는 점, 또는 다른 지표(ROE, 부채비율, "
-    "성장률 등)를 함께 봐야 한다는 점이 문제나 선택지에 자연스럽게 드러나게 하세요. "
+    "함께 살펴봐야 할 다른 요소가 무엇인지 문제나 선택지에 자연스럽게 드러나게 하세요. "
     "억지스러운 가정이나 인위적인 수치 설정은 넣지 마세요.",
 
-    "실제 투자 상황(매수할지, 보유할지, 매도할지)에서 이 개념을 적용해 "
+    "실제 투자 상황(매수할지, 보유할지, 매도할지)에서 이 개념이 어떻게 쓰이는지 "
     "판단하는 문제를 만드세요. 구체적인 상황 설정을 넣으세요.",
 
-    "이 개념을 쓸 수 없거나 수치가 왜곡되는 예외 상황을 다루는 문제를 만드세요. "
-    "적자 기업, 일회성 이익, 자본잠식 같은 구체적인 예외를 지문에 넣으세요.",
+    "이 개념이 적용되지 않거나 예외가 되는 상황을 다루는 문제를 만드세요. "
+    "해당 개념에 실제로 존재하는 예외를 쓰고, 억지로 만들어내지 마세요.",
 ]
 
 
@@ -173,6 +182,111 @@ def angle_for(slot_index: int) -> str:
     return GENERATION_ANGLES[slot_index % len(GENERATION_ANGLES)]
 
 
+# 정답을 몇 번 자리에 놓을지도 지정해서 돌린다.
+#
+# 실측 사고: 정답이 1번에 몰렸다 (9B 78.7%, gpt-5.4 85.7%. 기대값은 25%).
+# 원인은 프롬프트의 예시 JSON 에 "correct_no": 1 이 박혀 있던 것이다.
+# 관점 로테이션 때와 같은 종류의 사고 - 예시에 넣은 값을 모델이 그대로 따라간다.
+#
+# 그냥 두면 두 가지가 망가진다.
+#   1. 서비스: 사용자가 1번만 찍어도 79% 를 맞힌다.
+#   2. 학습: 파인튜닝 모델이 "정답은 1번"을 그대로 배운다.
+#
+# 생성 후에 선택지를 섞는 방법은 쓰지 않는다. 해설의 18% 가
+# "2번은 ~이고, 3번은 ~" 처럼 번호를 직접 언급해서 섞으면 해설이 깨진다.
+# 대신 생성 전에 자리를 지정하고, 안 지키면 재생성한다.
+#
+# 관점(5개)과 서로소가 되도록 4로 나눈 나머지를 쓴다.
+# 5와 4는 서로소라 슬롯이 20개 돌아야 같은 (관점, 위치) 조합이 반복된다.
+ANSWER_POSITIONS = (1, 2, 3, 4)
+
+# 문구에 수를 적을 때 조심할 것.
+# 처음에 "나머지 **세** 자리에는 사실이 아닌 문장을 넣으세요"라고 썼더니
+# 모델이 선택지를 3개만 만들었다(실측: 탈락 사유의 18.2%, 전부 "3개").
+# 바로 앞에 심어둔 수를 그대로 따라간 것이다. 개수는 4로만 말한다.
+ANSWER_POSITION_BLOCK = """
+- **선택지는 정확히 4개입니다. no 는 1, 2, 3, 4 를 하나씩 모두 써야 합니다.**
+- 그중 **{answer_pos}번 선택지만 사실인 문장(정답)** 으로 쓰세요.
+  나머지 선택지는 모두 사실이 아닌 문장이어야 합니다.
+- 해설에서 선택지 번호를 언급한다면 이 배치와 일치해야 합니다.
+"""
+
+
+def answer_pos_for(slot_index: int) -> int:
+    """주제별 n번째 문제에서 정답이 놓일 선택지 번호."""
+    return ANSWER_POSITIONS[slot_index % len(ANSWER_POSITIONS)]
+
+
+def answer_pos_offset(topic: str) -> int:
+    """주제마다 정답 위치 순환의 시작점을 다르게 한다.
+
+    한 주제에 5문제인데 위치는 4주기라 1번이 두 번 걸린다.
+    모든 주제가 1번부터 시작하면 전체에서 1번만 40%가 된다(실측 정확히 40.0%).
+    주제별로 시작점을 밀면 남는 한 자리가 골고루 퍼진다.
+
+    파이썬 hash() 는 실행마다 값이 달라져 재현이 안 되므로 쓰지 않는다.
+    """
+    return sum(ord(c) for c in topic) % len(ANSWER_POSITIONS)
+
+
+def assert_answer_position(correct_no: int, answer_pos: int | None) -> None:
+    """지시한 자리에 정답을 놓지 않았으면 AssertionError.
+
+    enforce_answer_position 으로 고칠 수 없었던 경우에만 걸린다(안전망).
+    """
+    if not answer_pos:
+        return
+    assert correct_no == answer_pos, (
+        f"정답 위치 불일치: {answer_pos}번에 놓으라고 했으나 {correct_no}번에 놓음"
+    )
+
+
+_CHOICE_REF = re.compile(r"(?<![0-9])([1-4])\s*번")
+# 선택지가 수치·기호로만 되어 있으면 순서에 의미가 있을 수 있어 자리를 바꾸지 않는다
+# (예: "1. 10%  2. 20%  3. 30%" — 섞으면 오름차순이 깨진다)
+_NUMERIC_CHOICE = re.compile(r"^[\d.,%\s원배주개~\-+]+$")
+
+
+def enforce_answer_position(data: dict, answer_pos: int | None) -> None:
+    """정답을 지시한 자리로 옮긴다 (data 를 제자리에서 수정).
+
+    지시를 어겼다고 매번 재생성시키면 비용이 크다. 실측: 정답을 4번에 놓으라는
+    지시를 9B 가 거의 못 지켜서, 5개 주제 중 2개가 재시도 3회를 소진하고
+    통째로 실패했다. 특정 자리를 못 쓰면 그 자리가 영영 안 나와 편향이 남는다.
+
+    그래서 재생성 대신 **정답과 목표 자리의 내용을 맞바꾼다.** 오답끼리는
+    서로 대체 가능하므로 문제의 뜻이 달라지지 않는다.
+    바뀐 두 번호는 해설에서도 함께 고쳐준다. 해설의 18% 가 "2번은 ~" 처럼
+    선택지 번호를 직접 언급하는데, 안 고치면 해설이 어긋난다.
+
+    바꿀 수 없는 경우(수치 선택지 등)에는 그대로 두고, 이어지는
+    assert_answer_position 이 잡아 재생성으로 넘긴다.
+    """
+    if not answer_pos:
+        return
+    current = data.get("correct_no")
+    choices = data.get("choices")
+    if current == answer_pos or not isinstance(current, int) or not choices:
+        return
+
+    by_no = {c.get("no"): c for c in choices}
+    src, dst = by_no.get(current), by_no.get(answer_pos)
+    if not src or not dst:
+        return
+    if (_NUMERIC_CHOICE.match(src.get("text", "")) and
+            _NUMERIC_CHOICE.match(dst.get("text", ""))):
+        return
+
+    src["text"], dst["text"] = dst.get("text", ""), src.get("text", "")
+    data["correct_no"] = answer_pos
+
+    explanation = data.get("explanation") or ""
+    if explanation:
+        swap = {str(current): str(answer_pos), str(answer_pos): str(current)}
+        data["explanation"] = _CHOICE_REF.sub(
+            lambda m: f"{swap.get(m.group(1), m.group(1))}번", explanation)
+
+
 def format_avoid_block(texts: list[str]) -> str:
     """이미 생성된 문제 목록을 프롬프트에 넣을 텍스트로 변환한다."""
     if not texts:
@@ -184,9 +298,12 @@ def format_avoid_block(texts: list[str]) -> str:
 # 결정론적 검사 (생성 직후, LLM 호출 없음)
 # =========================================================
 
-# 소문자 영단어 3글자 이상 = 한국어 문장에 영어가 새어 들어온 것.
-# PER / EPS / ROE / ETF 같은 정당한 대문자 약어는 걸리지 않는다.
-_LATIN_LEAK = re.compile(r"[a-z]{3,}")
+# 라틴 문자 단어. 전부 대문자면 지표 약어(PER, EPS, ROE, ETF, OX)로 보고 허용하고,
+# 그 외에는 한글로 써야 할 영어 단어로 본다.
+#
+# 소문자만 보던 이전 방식은 "Beta 효과" 에서 "eta" 만 잡아 사유가 이상하게 남았다.
+# 판정 자체는 옳았지만("베타"로 써야 함) 학습 데이터의 reject_reason 이 부정확해진다.
+_LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
 
 # 한자·일본어 가나 혼입. Qwen 계열에서 자주 나온다
 # (실측: "주가 상승률이 항상 높은 公司股票").
@@ -202,8 +319,11 @@ _LEARNER_REFERENCES = (
 
 def assert_korean(text: str, where: str = "텍스트") -> None:
     """한국어 문장에 영어·한자·가나가 섞였으면 AssertionError."""
-    leak = _LATIN_LEAK.search(text)
-    assert leak is None, f"{where}에 영어 단어 혼입: {leak.group()}"
+    for m in _LATIN_WORD.finditer(text):
+        word = m.group()
+        if word.isupper():  # PER, EPS, ROE, ETF, OX 등 약어는 허용
+            continue
+        raise AssertionError(f"{where}에 영어 단어 혼입: {word}")
     cjk = _CJK_LEAK.search(text)
     assert cjk is None, f"{where}에 한자/가나 혼입: {cjk.group()}"
 
@@ -219,33 +339,54 @@ def assert_ox_declarative(question_text: str) -> None:
     assert not question_text.strip().endswith("?"), "OX 문제가 의문문"
 
 
-def check_mc_question(data: dict, learner_reference_check: bool = False) -> None:
+# 주제 이탈 판정은 topic_guard 에 있다 (의존성 없이 스크립트에서도 쓰기 위해).
+# 기존 호출부·테스트가 quality.assert_on_topic 을 참조하므로 이름을 그대로 노출한다.
+from app.services.quiz.topic_guard import assert_on_topic  # noqa: E402,F401
+
+
+def check_mc_question(
+    data: dict, learner_reference_check: bool = False, topic: str = "",
+    topic_desc: str = "", answer_pos: int | None = None,
+) -> None:
     """객관식 생성 결과의 결정론적 검사. 실패 시 AssertionError -> 재시도."""
-    assert "question_text" in data
-    assert "choices" in data and len(data["choices"]) == 4
-    assert "correct_no" in data and 1 <= data["correct_no"] <= 4
-    assert "explanation" in data
+    assert "question_text" in data, "필수 필드 누락: question_text"
+    assert "choices" in data, "필수 필드 누락: choices"
+    assert len(data["choices"]) == 4, f"선택지가 4개가 아님: {len(data['choices'])}개"
+    assert "correct_no" in data, "필수 필드 누락: correct_no"
+    assert 1 <= data["correct_no"] <= 4, f"정답 번호 범위 이탈: {data['correct_no']}"
+    assert "explanation" in data, "필수 필드 누락: explanation"
     # 선택지 번호가 1~4로 중복 없이 존재해야 is_correct 매핑이 깨지지 않는다
     nos = sorted(c["no"] for c in data["choices"])
     assert nos == [1, 2, 3, 4], f"선택지 번호 이상: {nos}"
+
+    # 선택지 구조가 온전한 것을 확인한 뒤에 자리를 옮긴다.
+    # 못 옮기는 경우(수치 선택지 등)만 assert 가 잡아 재생성으로 넘어간다.
+    enforce_answer_position(data, answer_pos)
+    assert_answer_position(data["correct_no"], answer_pos)
 
     assert_korean(data["question_text"], "문제 지문")
     for c in data["choices"]:
         assert_korean(c["text"], "선택지")
     assert_korean(data["explanation"], "해설")
+    assert_on_topic(data["question_text"], topic, topic_desc)
     if learner_reference_check:
         assert_no_learner_reference(data["explanation"])
 
 
-def check_ox_question(data: dict, learner_reference_check: bool = False) -> None:
+def check_ox_question(
+    data: dict, learner_reference_check: bool = False, topic: str = "",
+    topic_desc: str = "",
+) -> None:
     """OX 생성 결과의 결정론적 검사. 실패 시 AssertionError -> 재시도."""
-    assert "question_text" in data
-    assert "answer" in data and data["answer"] in ["O", "X"]
-    assert "explanation" in data
+    assert "question_text" in data, "필수 필드 누락: question_text"
+    assert "answer" in data, "필수 필드 누락: answer"
+    assert data["answer"] in ["O", "X"], f"answer 가 O/X 가 아님: {data['answer']}"
+    assert "explanation" in data, "필수 필드 누락: explanation"
 
     assert_ox_declarative(data["question_text"])
     assert_korean(data["question_text"], "문제 지문")
     assert_korean(data["explanation"], "해설")
+    assert_on_topic(data["question_text"], topic, topic_desc)
     if learner_reference_check:
         assert_no_learner_reference(data["explanation"])
 
@@ -316,22 +457,32 @@ VALIDATE_PROMPT = ChatPromptTemplate.from_template("""
    문제는 "PER이 낮아진 이유"를 묻는데 해설이 "PER이 상승한다"를 설명하면
    방향이 반대이므로 불합격입니다.
 
-4. 해설의 내용이 표시된 정답과 일치하는가?
+4. **지문이 묻는 주장과 정답 선택지의 주장이 서로 반대가 아닌가?**
+   지문이 "A해야 한다는 판단으로 옳은 것은"이라고 물었으면
+   정답도 A를 지지하는 내용이어야 합니다.
+   정답이 "A할 수 없다", "A하면 안 된다"처럼 지문을 부정하면 불합격입니다.
+   (나쁜 예: 지문 "주가가 조금 내렸을 때 바로 매도해야 한다는 판단으로 옳은 것은?"
+    정답 "하루의 작은 하락만 보고 바로 매도할지 정했다고 말할 수는 없다"
+    — 지문은 매도를 지지하는 판단을 물었는데 정답은 매도를 부정한다)
+   지문 자체가 "A하면 안 되는 이유는"처럼 이미 부정형이면 정상입니다.
+
+5. 해설의 내용이 표시된 정답과 일치하는가?
    (해설은 A라고 설명하는데 정답은 B로 되어 있으면 불합격)
 
-5. 문제 지문의 전제와 정답이 서로 모순되지 않는가?
+6. 문제 지문의 전제와 정답이 서로 모순되지 않는가?
 
-6. 지표의 정의가 정확한가?
+7. 지표의 정의가 정확한가?
    (PER = 주가 / 주당순이익(EPS), 배당수익률 = 연간 배당금 / 주가)
 
-7. OX 문제라면, 이중부정 등으로 참/거짓 판단이 헷갈리게 되어 있지 않은가?
+8. OX 문제라면, 이중부정 등으로 참/거짓 판단이 헷갈리게 되어 있지 않은가?
 
-8. 문제 문장이 비문이거나 무엇을 묻는지 불분명하지 않은가?
+9. 문제 문장이 비문이거나 무엇을 묻는지 불분명하지 않은가?
 
 판정 기준:
 - 위 항목에 **명백히** 걸릴 때만 "ok": false 로 하세요.
-  2번(오답에 사실이 섞임)과 3번(문제와 해설의 방향 불일치)은
+- 2번(오답에 사실이 섞임), 3번(문제와 해설의 방향), 4번(지문과 정답의 방향)은
   놓치기 쉬우니 특히 주의해서 보세요.
+  실측으로 4번을 놓친 적이 있으니 정답 선택지를 지문과 나란히 놓고 읽으세요.
 - **조금이라도 판단이 서지 않으면 "ok": true 로 통과시키세요.**
   멀쩡한 문제를 불합격 처리하면 불필요한 재생성이 발생합니다.
 - reason은 불합격일 때만, **30자 이내 한 문장**으로 쓰세요.
@@ -378,11 +529,10 @@ async def validate_questions(questions: list[dict]) -> dict[int, str]:
     if not questions:
         return {}
 
-    chain = VALIDATE_PROMPT | get_llm()
+    block = format_questions_for_validation(questions)
     try:
-        response = await chain.ainvoke({
-            "questions_block": format_questions_for_validation(questions),
-        })
+        chain = VALIDATE_PROMPT | get_llm()
+        response = await chain.ainvoke({"questions_block": block})
         data = extract_json(response.content)
     except Exception as e:
         logger.warning(f"문제 검증 실패 - 검증 없이 통과시킴: {e}")

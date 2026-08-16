@@ -26,8 +26,10 @@ from app.services.quiz.quality import (
     GENERATION_ANGLES,
     MC_QUALITY_RULES,
     OX_QUALITY_RULES,
+    ANSWER_POSITION_BLOCK,
     QUALITY_RULES,
     angle_for,
+    answer_pos_for,
     check_mc_question,
     check_ox_question,
     extract_json,
@@ -84,7 +86,7 @@ REVIEW_MC_PROMPT = ChatPromptTemplate.from_template("""
 """ + _COMMON_RULES + """
 """ + MC_QUALITY_RULES + """
 - 학생이 고른 오답에 담긴 오해를 오답 선택지 중 하나로 배치하세요.
-""" + ANGLE_BLOCK + """
+""" + ANGLE_BLOCK + ANSWER_POSITION_BLOCK + """
 JSON 형식:
 {{
   "question_text": "문제 내용 (한 문장)",
@@ -94,7 +96,7 @@ JSON 형식:
     {{"no": 3, "text": "선택지3"}},
     {{"no": 4, "text": "선택지4"}}
   ],
-  "correct_no": 정답번호(1~4 중 하나),
+  "correct_no": {answer_pos},
   "explanation": "해설 내용 (2~3문장)",
   "topic": "{topic}"
 }}
@@ -269,6 +271,7 @@ def format_wrong_context(samples: list[WrongAnswerItem]) -> str:
 
 async def _generate_review_mc(
     user: UserContext, topic: str, wrong_context: str, avoid: list[str], angle: str,
+    answer_pos: int | None = None,
 ) -> dict:
     level_guide = LEVEL_GUIDE.get(user.investment_level, LEVEL_GUIDE["미설정"])
     chain = REVIEW_MC_PROMPT | get_llm()
@@ -282,10 +285,13 @@ async def _generate_review_mc(
                 "wrong_context": wrong_context,
                 "avoid_block": format_avoid_block(avoid),
                 "angle": angle,
+                # 지정하지 않으면 정답이 1번에 몰린다(실측 78.7%)
+                "answer_pos": answer_pos or answer_pos_for(0),
             })
             data = extract_json(response.content)
 
-            check_mc_question(data, learner_reference_check=True)
+            check_mc_question(data, learner_reference_check=True, topic=topic,
+                              answer_pos=answer_pos)
 
             return {
                 "question_type": "MULTIPLE_CHOICE",
@@ -310,6 +316,7 @@ async def _generate_review_mc(
 
 async def _generate_review_ox(
     user: UserContext, topic: str, wrong_context: str, avoid: list[str], angle: str,
+    answer_pos: int | None = None,   # OX 는 선택지가 2개뿐이라 쓰지 않는다 (호출부 통일용)
 ) -> dict:
     level_guide = LEVEL_GUIDE.get(user.investment_level, LEVEL_GUIDE["미설정"])
     chain = REVIEW_OX_PROMPT | get_llm()
@@ -326,7 +333,7 @@ async def _generate_review_ox(
             })
             data = extract_json(response.content)
 
-            check_ox_question(data, learner_reference_check=True)
+            check_ox_question(data, learner_reference_check=True, topic=topic)
 
             return {
                 "question_type": "OX",
@@ -426,7 +433,7 @@ async def generate_quiz_from_wrong_answers(
     # 주제별 이미 생성된 문제 - 프롬프트 avoid 목록으로 전달
     generated_by_topic: dict[str, list[str]] = defaultdict(list)
 
-    for group in slots:
+    for set_index, group in enumerate(slots):
         key = group["key"]
         samples = group["samples"]
 
@@ -440,6 +447,9 @@ async def generate_quiz_from_wrong_answers(
         # 같은 주제의 n번째 슬롯 -> n번째 출제 관점 (결정론적 순환)
         angle = angle_for(slot_index[key])
         slot_index[key] += 1
+        # 정답 위치는 주제별이 아니라 **세트 전체 순번**으로 돌린다.
+        # 주제별로 돌리면 주제가 5개일 때 모두 0번째 슬롯이라 전부 1번이 된다.
+        answer_pos = answer_pos_for(set_index)
 
         generate = (
             _generate_review_ox
@@ -448,11 +458,13 @@ async def generate_quiz_from_wrong_answers(
         )
         avoid = generated_by_topic[key]
 
-        question = await generate(user, group["topic"], wrong_context, avoid, angle)
+        question = await generate(
+            user, group["topic"], wrong_context, avoid, angle, answer_pos)
         # 세트 안 중복(문자 유사도) + 과거 요청과의 중복(임베딩 유사도).
         # 그래도 겹치면 그대로 채택한다 (문제 개수는 항상 맞춰야 하므로).
         if await _is_duplicate(question["question_text"], all_texts, user):
-            question = await generate(user, group["topic"], wrong_context, avoid, angle)
+            question = await generate(
+                user, group["topic"], wrong_context, avoid, angle, answer_pos)
 
         all_texts.append(question["question_text"])
         generated_by_topic[key].append(question["question_text"])
@@ -464,7 +476,8 @@ async def generate_quiz_from_wrong_answers(
         question["primary_detail_code"] = detail_codes[0] if detail_codes else None
         questions.append(question)
         # 검증에서 불합격 시 같은 조건으로 재생성하기 위해 생성 인자를 보관
-        gen_args.append((generate, group["topic"], wrong_context, avoid, angle))
+        gen_args.append(
+            (generate, group["topic"], wrong_context, avoid, angle, answer_pos))
 
     await _revalidate_and_fix(questions, gen_args, user)
     # 검증·재생성이 끝난 확정본만 저장한다
@@ -489,15 +502,16 @@ async def _revalidate_and_fix(
     타협이며, 재생성으로도 안 고쳐지면 원본보다 나빠질 이유는 없으므로 채택한다.
     """
     failed = await validate_questions(questions)
+
     if not failed:
         logger.info("문제 검증 통과 (전체 합격)")
         return
 
     logger.warning(f"검증 불합격 {len(failed)}건 - 재생성: {list(failed.values())}")
     for idx, reason in failed.items():
-        generate, topic, wrong_context, avoid, angle = gen_args[idx]
+        generate, topic, wrong_context, avoid, angle, answer_pos = gen_args[idx]
         try:
-            fixed = await generate(user, topic, wrong_context, avoid, angle)
+            fixed = await generate(user, topic, wrong_context, avoid, angle, answer_pos)
         except ValueError as e:
             # 재생성 실패 시 원본 유지 - 문제 개수는 항상 맞춰야 한다
             logger.warning(f"{idx + 1}번 재생성 실패 - 원본 유지: {e}")

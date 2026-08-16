@@ -34,7 +34,10 @@ class _Resp:
         self.content = content
 
 
-def _mc(question, explanation="정상적인 해설 문장입니다.", correct=2):
+# correct=None 이면 스텁이 "프롬프트가 요구한 정답 위치"를 따른다.
+# 정답이 1번에 몰리는 문제를 막으려고 문제마다 위치를 지정하게 됐고,
+# 대부분의 테스트는 위치가 관심사가 아니므로 기본을 순응으로 둔다.
+def _mc(question, explanation="정상적인 해설 문장입니다.", correct=None):
     return json.dumps({
         "question_text": question,
         "choices": [{"no": i, "text": f"보기{i}"} for i in range(1, 5)],
@@ -64,6 +67,14 @@ _FALLBACK_POOL = [
 ]
 
 
+def _obey_answer_pos(raw: str, prompt_vars: dict) -> str:
+    """correct_no 가 null 인 응답을 지시받은 자리로 채운다 (지시를 따른 모델 흉내)."""
+    if '"correct_no": null' not in raw:
+        return raw
+    return raw.replace('"correct_no": null',
+                       f'"correct_no": {prompt_vars.get("answer_pos", 1)}')
+
+
 def _install_stubs():
     lc_core = types.ModuleType("langchain_core")
     lc_prompts = types.ModuleType("langchain_core.prompts")
@@ -85,8 +96,9 @@ def _install_stubs():
                 return _Resp(json.dumps(VALIDATE_RESULT, ensure_ascii=False))
             CALLS.append(kwargs)
             if RESPONSES:
-                return _Resp(RESPONSES.pop(0))
-            return _Resp(_mc(_FALLBACK_POOL[(len(CALLS) - 1) % len(_FALLBACK_POOL)]))
+                return _Resp(_obey_answer_pos(RESPONSES.pop(0), kwargs))
+            return _Resp(_obey_answer_pos(
+                _mc(_FALLBACK_POOL[(len(CALLS) - 1) % len(_FALLBACK_POOL)]), kwargs))
 
     lc_prompts.ChatPromptTemplate = _Template
     lc_core.prompts = lc_prompts
@@ -106,6 +118,12 @@ def _install_stubs():
     config = types.ModuleType("app.core.config")
 
     class _Settings:
+        # build_llm 이 LLM_BACKEND 를 보므로 스텁에도 있어야 한다.
+        # 테스트는 ChatOllama 스텁을 쓰므로 ollama 경로로 고정한다.
+        LLM_BACKEND = "ollama"
+        LLM_BASE_URL = "http://127.0.0.1:8080/v1"
+        LLM_API_KEY = "test"
+        LLM_DISABLE_THINKING = True
         OLLAMA_BASE_URL = "http://localhost:11434"
         LLM_MODEL = "qwen3.5:9b"
         QUIZ_BANK_COLLECTION = "quiz_bank_test"
@@ -319,10 +337,10 @@ def test_pipeline():
     # 중복 감지 후 재생성
     reset([_mc("PER이 낮으면 저평가라고 단정할 수 있는가"),
            _mc("PER이 낮으면 저평가라고 단정할 수 있는가"),
-           _mc("배당수익률 계산에 사용하는 분모는 무엇인가"),
-           _mc("영업이익률이 의미하는 바로 옳은 것은"),
-           _mc("부채비율이 높을 때 유의할 점은 무엇인가"),
-           _mc("시가총액을 구하는 방법으로 옳은 것은")])
+           _mc("PER 을 계산할 때 분모로 쓰는 값은 무엇인가"),
+           _mc("업종 평균과 비교해야 하는 이유로 옳은 것은"),
+           _mc("적자 기업에서 이 지표를 쓰기 어려운 까닭은"),
+           _mc("일회성 이익이 반영되면 나타나는 현상으로 옳은 것은")])
     qs = run([wrong("원본", "PER_BASIC")])
     check("중복 감지 -> 재생성 호출", len(CALLS) == 6, len(CALLS))
     check("중복 문제 제외됨", qs[1]["question_text"] != qs[0]["question_text"])

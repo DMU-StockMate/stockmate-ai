@@ -94,7 +94,7 @@ def show_similarity_distribution(points):
     print("\n--- 판단 ---")
     if top < settings.QUIZ_DUP_THRESHOLD:
         print(f"  가장 비슷한 쌍도 {top:.3f} 으로 임계값 {settings.QUIZ_DUP_THRESHOLD} 미만입니다.")
-        print(f"  위 '가장 비슷한 쌍'을 눈으로 보고 실제로 중복이라 느껴지면")
+        print("  위 '가장 비슷한 쌍'을 눈으로 보고 실제로 중복이라 느껴지면")
         print(f"  QUIZ_DUP_THRESHOLD 를 {max(top - 0.02, 0.5):.2f} 근처로 낮추세요.")
     else:
         n_caught = sum(1 for s, _, _ in pairs if s >= settings.QUIZ_DUP_THRESHOLD)

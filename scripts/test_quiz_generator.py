@@ -1,4 +1,4 @@
-"""일반/프롬프트 기반 문제 생성(app/services/quiz/generator.py) 회귀 테스트.
+﻿"""일반/프롬프트 기반 문제 생성(app/services/quiz/generator.py) 회귀 테스트.
 
 품질 장치(app/services/quiz/quality.py)를 오답 기반 생성에서 공통 모듈로 분리한 뒤,
 `/quiz/generate` 와 `/quiz/generate/prompt` 에도 동일하게 적용됐는지 확인한다.
@@ -11,6 +11,7 @@ LLM은 호출하지 않는다. langchain 체인을 스텁으로 갈아끼워 프
 """
 import asyncio
 import json
+import math
 import sys
 import types
 from pathlib import Path
@@ -36,7 +37,10 @@ class _Resp:
         self.content = content
 
 
-def _mc(question, explanation="정상적인 해설 문장입니다.", correct=2, choices=None):
+# correct=None 이면 스텁이 "프롬프트가 요구한 정답 위치"를 그대로 따른다.
+# 정답 위치 검사가 생긴 뒤로, 대부분의 테스트는 위치가 관심사가 아니라
+# 지시를 따르기만 하면 된다. 위치 불이행을 시험할 때만 숫자를 명시한다.
+def _mc(question, explanation="정상적인 해설 문장입니다.", correct=None, choices=None):
     return json.dumps({
         "question_text": question,
         "choices": choices or [{"no": i, "text": f"보기{i}"} for i in range(1, 5)],
@@ -63,6 +67,17 @@ _FALLBACK = [
 ]
 
 
+def _obey_answer_pos(raw: str, prompt_vars: dict) -> str:
+    """correct_no 가 null 인 응답을 "지시받은 자리"로 채운다.
+
+    실제 모델이 지시를 따랐을 때의 응답을 흉내내는 것이다.
+    """
+    if '"correct_no": null' not in raw:
+        return raw
+    return raw.replace('"correct_no": null',
+                       f'"correct_no": {prompt_vars.get("answer_pos", 1)}')
+
+
 def _install_stubs():
     lc_core = types.ModuleType("langchain_core")
     lc_prompts = types.ModuleType("langchain_core.prompts")
@@ -87,6 +102,9 @@ def _install_stubs():
         def __or__(self, other):
             return self
 
+        def format(self, **kwargs):
+            return self.template.format(**kwargs)
+
         async def ainvoke(self, kwargs):
             CALLS.append({"kind": self.kind, **kwargs})
             if self.kind == "validate":
@@ -96,13 +114,13 @@ def _install_stubs():
             if self.kind == "map":
                 return _Resp(json.dumps({"mappings": []}, ensure_ascii=False))
             if RESPONSES:
-                return _Resp(RESPONSES.pop(0))
+                return _Resp(_obey_answer_pos(RESPONSES.pop(0), kwargs))
             n = len([c for c in CALLS if c["kind"] == "generate"])
             text = _FALLBACK[(n - 1) % len(_FALLBACK)]
             if self.is_ox:
                 # OX는 평서문이어야 하므로 폴백 문장을 평서문으로 바꿔 쓴다
                 return _Resp(_ox(text.rstrip("?는은") + " 라고 볼 수 있다."))
-            return _Resp(_mc(text))
+            return _Resp(_obey_answer_pos(_mc(text), kwargs))
 
     lc_prompts.ChatPromptTemplate = _Template
     lc_core.prompts = lc_prompts
@@ -121,6 +139,13 @@ def _install_stubs():
     config = types.ModuleType("app.core.config")
 
     class _Settings:
+        # 백엔드 전환이 생기면서 build_llm 이 LLM_BACKEND 를 본다.
+        # 스텁에 없으면 AttributeError 로 테스트가 죽으므로 함께 둔다.
+        # 테스트는 ChatOllama 스텁을 쓰므로 ollama 경로로 고정한다.
+        LLM_BACKEND = "ollama"
+        LLM_BASE_URL = "http://127.0.0.1:8080/v1"
+        LLM_API_KEY = "test"
+        LLM_DISABLE_THINKING = True
         OLLAMA_BASE_URL = "http://localhost:11434"
         LLM_MODEL = "qwen3.5:9b"
         QUIZ_BANK_COLLECTION = "quiz_bank_test"
@@ -263,8 +288,8 @@ def test_generate_batch():
     # 근사 중복 -> 재생성
     reset([_mc("PER이 낮으면 저평가라고 단정할 수 있는가"),
            _mc("PER이 낮으면 저평가라고 단정할 수 있는가"),
-           _mc("배당수익률 계산의 분모는 무엇인가"),
-           _mc("영업이익률이 의미하는 바로 옳은 것은")])
+           _mc("PER 을 계산할 때 분모로 쓰는 값은 무엇인가"),
+           _mc("업종 평균과 비교해야 하는 이유로 옳은 것은")])
     qs = asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2))
     check("근사 중복 재생성", len(gen_calls()) == 3, len(gen_calls()))
     check("중복 제거됨", qs[0]["question_text"] != qs[1]["question_text"])
@@ -478,6 +503,72 @@ def test_language_guard():
 
 
 # =========================================================
+# 5-b. 주제 이탈 차단
+# =========================================================
+
+def test_topic_guard():
+    print("\n--- 주제 이탈 차단 ---")
+
+    # 실측: 주제가 "주식"인데 PER 문제가 나와 라벨이 틀어졌다 (이탈률 32%)
+    cases = [
+        ("주식", "", "기업의 주가가 크게 떨어졌을 때 PER 이 낮아지는 이유는?", False),
+        ("주가", "", "PER 이 높은 주식은 무엇을 의미하는가?", False),
+        ("주식", "", "주식을 보유한 주주가 가지는 권리로 옳은 것은?", True),
+        ("PER", "", "PER 을 계산할 때 분모에 들어가는 값은?", True),
+        ("배당", "", "배당수익률이 높으면 항상 좋은 기업인가?", True),
+        ("거래량", "", "거래량이 급증했을 때 해석으로 옳은 것은?", True),
+        ("", "", "주제가 없으면 판단하지 않는다", True),
+
+        # --- 상위 개념 주제 (실측 오탐: 정상 출제를 이탈로 막아 주제를 통째로 날렸다) ---
+        # 볼린저밴드는 보조지표의 한 종류다
+        ("보조지표", "기술적 보조지표를 투자 근거로 활용",
+         "볼린저밴드의 상단선에 주가가 닿았을 때 해석으로 옳은 것은?", True),
+        ("보조지표", "기술적 보조지표를 투자 근거로 활용",
+         "이동평균선이 우상향할 때의 의미로 옳은 것은?", True),
+        # 상위 개념이라도 계열이 다르면 여전히 이탈이다
+        ("보조지표", "기술적 보조지표를 투자 근거로 활용",
+         "PER 이 낮은 기업의 특징으로 옳은 것은?", False),
+        # 기업 비교는 지표 사용이 곧 주제다
+        ("같은 업종 내 기업 비교", "동일 업종 기업의 지표와 성과를 비교",
+         "같은 업종의 두 기업 중 PER 이 더 낮은 쪽을 어떻게 볼 수 있는가?", True),
+        # 설명이 없으면 주제명만으로 판단한다 (review 경로)
+        ("보조지표", "", "RSI 가 70을 넘었을 때 해석으로 옳은 것은?", True),
+
+        # --- 주인공 판정 (실측: 채택분의 25% 가 주제를 사칭한 PER 문제였다) ---
+        # PER 의 정의가 "주가/주당순이익"이라 PER 문제에는 "주가"가 반드시 나온다.
+        # 주제어가 들어 있다는 이유만으로 통과시키면 안 된다.
+        ("주가", "", "PER 이 같은 수준에서 주가가 오르면 PER 값은 어떻게 변하는가?", False),
+        ("주가", "", "PER(주가수익비율) 수치를 계산할 때 분모로 쓰는 값은?", False),
+        # 주제어가 더 자주 나오면 그 주제의 문제다
+        ("주가", "", "주가가 오르내리는 이유와 주가를 결정하는 요소로 옳은 것은?", True),
+        # 다른 개념을 도구로만 쓴 정상 문제는 통과해야 한다 (같은 횟수)
+        ("안정형", "", "안정형 투자자가 PER 이 낮은 주식을 고를 때 유의할 점은?", True),
+        # 주제 개념의 구성 요소는 몇 번 나와도 이탈이 아니다
+        ("PER", "", "PER 은 주가를 주당순이익(EPS)으로 나눈 값이며 주당순이익이 줄면 커진다", True),
+        # 약어 대신 정식 명칭으로 써도 잡아야 한다
+        ("거래량", "", "주가수익비율이 높다는 것은 무엇을 뜻하는가?", False),
+    ]
+    for topic, desc, text, should_pass in cases:
+        try:
+            Q.assert_on_topic(text, topic, desc)
+            passed = True
+        except AssertionError:
+            passed = False
+        check(f"주제 '{topic or '(없음)'}' - {text[:26]}", passed == should_pass)
+
+    # 생성 경로에서 이탈본이 거부되고 재생성되는지
+    reset([_mc("기업의 주가가 떨어질 때 PER 이 낮아지는 이유는?"),
+           _mc("주식을 보유한 주주가 가지는 권리로 옳은 것은?")])
+    q = asyncio.run(G.generate_quiz(USER, "MULTIPLE_CHOICE", "주식"))
+    check("이탈본 거부 후 재생성", "PER" not in q["question_text"], q["question_text"][:30])
+
+    # 난이도 가이드에 지표명이 없어야 한다 (이것 때문에 이탈이 났었다)
+    for level, guide in G.LEVEL_GUIDE.items():
+        check(f"난이도 가이드에 지표명 없음 - {level}",
+              not any(x in guide for x in ("PER", "PBR", "ROE", "EPS")))
+
+
+# =========================================================
 # 6-a. 검증 자기 번복 처리
 # =========================================================
 
@@ -562,6 +653,118 @@ def test_shared_module():
           and Q.ANGLE_BLOCK in R.REVIEW_MC_PROMPT.template)
 
 
+# =========================================================
+# 7-b. 정답 위치 분산
+# =========================================================
+
+def test_answer_position():
+    """정답이 특정 번호에 몰리지 않아야 한다.
+
+    실측 사고: 정답의 78.7%(9B) / 85.7%(gpt-5.4)가 1번이었다. 기대값은 25%.
+    원인은 프롬프트 예시 JSON 의 "correct_no": 1 이었다.
+    이 상태로 두면 사용자가 1번만 찍어도 대부분 맞고, 학습 데이터로 쓰면
+    파인튜닝 모델이 그 편향을 그대로 배운다.
+    """
+    print("\n--- 정답 위치 분산 ---")
+
+    # 4문제면 1~4번을 한 번씩 써야 한다
+    check("위치 순환", [Q.answer_pos_for(i) for i in range(6)] == [1, 2, 3, 4, 1, 2],
+          [Q.answer_pos_for(i) for i in range(6)])
+    # 관점(5주기)과 서로소여야 조합이 빨리 반복되지 않는다
+    check("관점 주기와 서로소",
+          math.gcd(len(Q.ANSWER_POSITIONS), len(Q.GENERATION_ANGLES)) == 1)
+
+    # 프롬프트에 예시 정답이 박혀 있으면 안 된다 (이것이 원인이었다)
+    check("MC 프롬프트에 correct_no 고정값 없음",
+          '"correct_no": 1' not in G.MC_PROMPT.template)
+    check("MC 프롬프트가 지정 위치를 요구", "{answer_pos}" in G.MC_PROMPT.template)
+
+    # 위치 지시문에 4 외의 개수를 적으면 모델이 그 수만큼 선택지를 만든다.
+    # 실측: "나머지 세 자리에" 때문에 선택지 3개짜리가 탈락분의 18.2% 를 차지했다.
+    for word in ("세 자리", "세 개", "3개", "3 개"):
+        check(f"위치 지시문에 '{word}' 없음", word not in Q.ANSWER_POSITION_BLOCK)
+    check("위치 지시문이 4개를 명시", "정확히 4개" in Q.ANSWER_POSITION_BLOCK)
+
+    # 주제마다 순환 시작점이 달라야 1번 쏠림(실측 40.0%)이 안 생긴다
+    starts = {Q.answer_pos_offset(t) for t in
+              ("PER", "배당", "거래량", "주가", "시가총액", "부채비율", "주식", "공시")}
+    check("주제별 시작점이 분산됨", len(starts) >= 3, sorted(starts))
+    check("시작점이 실행마다 같음",
+          Q.answer_pos_offset("PER") == Q.answer_pos_offset("PER"))
+
+    # 지시한 자리에 안 놓으면 거부되는가
+    for requested, actual, should_pass in [(3, 3, True), (3, 1, False), (None, 1, True)]:
+        try:
+            Q.assert_answer_position(actual, requested)
+            passed = True
+        except AssertionError:
+            passed = False
+        check(f"지시 {requested} / 실제 {actual}", passed == should_pass)
+
+    # --- 지시를 어겼을 때 자리를 옮겨 고치는가 ---
+    # 실측: 9B 는 정답을 4번에 놓으라는 지시를 거의 못 지켰다(negative 의 4번 비율 0%).
+    # 매번 재생성시켰더니 5개 주제 중 2개가 재시도를 소진하고 통째로 실패했다.
+    data = {
+        "question_text": "문제", "correct_no": 1,
+        "choices": [{"no": 1, "text": "정답 문장"}, {"no": 2, "text": "오답2"},
+                    {"no": 3, "text": "오답3"}, {"no": 4, "text": "오답4"}],
+        "explanation": "정답은 1번입니다. 2번과 4번은 사실이 아닙니다.",
+    }
+    Q.enforce_answer_position(data, 4)
+    check("정답 번호 갱신", data["correct_no"] == 4, data["correct_no"])
+    texts = {c["no"]: c["text"] for c in data["choices"]}
+    check("정답 문장이 4번으로 이동", texts[4] == "정답 문장", texts[4])
+    check("4번에 있던 오답은 1번으로", texts[1] == "오답4", texts[1])
+    check("건드리지 않은 자리는 그대로", texts[2] == "오답2" and texts[3] == "오답3")
+    # 해설이 번호를 언급하면 함께 고쳐야 한다 (해설의 18% 가 번호를 언급한다)
+    check("해설 번호도 교체", data["explanation"] == "정답은 4번입니다. 2번과 1번은 사실이 아닙니다.",
+          data["explanation"])
+
+    # 수치 선택지는 순서에 뜻이 있을 수 있어 바꾸지 않는다
+    numeric = {
+        "question_text": "문제", "correct_no": 1,
+        "choices": [{"no": i, "text": f"{i * 10}%"} for i in range(1, 5)],
+        "explanation": "해설",
+    }
+    Q.enforce_answer_position(numeric, 4)
+    check("수치 선택지는 그대로 두고 재생성에 맡김", numeric["correct_no"] == 1,
+          numeric["correct_no"])
+
+    # 이미 맞으면 아무것도 바꾸지 않는다
+    same = {"question_text": "문제", "correct_no": 2,
+            "choices": [{"no": i, "text": f"보기{i}"} for i in range(1, 5)],
+            "explanation": "정답은 2번입니다."}
+    Q.enforce_answer_position(same, 2)
+    check("이미 맞으면 무변경", same["explanation"] == "정답은 2번입니다.")
+
+    # 생성 경로에서도 4번 지시를 만족시키는가 (모델이 1번을 줘도)
+    reset([_mc("4번 지시인데 1번을 준 응답", correct=1)])
+    q = asyncio.run(G.generate_mc_question(USER, "PER", answer_pos=4))
+    pos = next(c["choice_no"] for c in q["choices"] if c["is_correct"])
+    check("생성 경로에서 자리 교정", pos == 4, pos)
+
+    # 생성 경로 전체에서 4문제의 정답 위치가 전부 다른가
+    # (correct=None -> 스텁이 프롬프트가 요구한 자리를 그대로 따른다)
+    reset([_mc(f"문제{i}") for i in range(1, 5)])
+    qs = asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=4))
+    positions = [
+        next(c["choice_no"] for c in q["choices"] if c["is_correct"]) for q in qs
+    ]
+    check("4문제 정답 위치가 모두 다름", sorted(positions) == [1, 2, 3, 4], positions)
+
+    # 지시를 어긴 응답은 재생성되는가.
+    # 두 번째 슬롯이 요구하는 자리를 구해, 그와 다른 값을 일부러 돌려준다.
+    wanted = Q.answer_pos_for(1 + Q.answer_pos_offset("PER"))
+    defiant = 1 if wanted != 1 else 2
+    reset([_mc("첫 시도"),                          # 요구대로 - 통과
+           _mc("두번째 - 지시 위반", correct=defiant),  # 다른 자리 -> 거부
+           _mc("두번째 - 재생성")])                    # 요구대로 -> 통과
+    qs = asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2))
+    pos2 = next(c["choice_no"] for c in qs[1]["choices"] if c["is_correct"])
+    check("지시 위반 시 재생성", pos2 == wanted, f"{pos2} (요구 {wanted})")
+
+
+
 if __name__ == "__main__":
     test_prompts_carry_quality_rules()
     test_deterministic_checks()
@@ -571,9 +774,11 @@ if __name__ == "__main__":
     test_remap_prefers_user_level()
     test_angle_rotation()
     test_language_guard()
+    test_topic_guard()
     test_validation_retraction()
     test_bank_integration()
     test_shared_module()
+    test_answer_position()
 
     print("\n" + "=" * 55)
     if FAILURES:
