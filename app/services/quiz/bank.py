@@ -140,6 +140,72 @@ async def is_duplicate_of_past(text: str, user_id: int | None = None) -> bool:
     return duplicate
 
 
+# 한 요청 안에서 같은 문장을 여러 번 임베딩하지 않도록 벡터를 재사용한다.
+# 세트 중복 검사는 매 문항마다 이전 문항 전체와 비교하므로, 캐시가 없으면
+# 임베딩 호출이 문항 수의 제곱으로 늘어난다 (bge-m3 는 CPU 라 1회 50~200ms).
+_vec_cache: dict[str, list[float]] = {}
+_VEC_CACHE_MAX = 256
+
+
+def _vector_of(text: str) -> list[float]:
+    vec = _vec_cache.get(text)
+    if vec is None:
+        vec = get_embeddings().embed_query(text)
+        _vec_cache[text] = vec
+        if len(_vec_cache) > _VEC_CACHE_MAX:
+            _vec_cache.pop(next(iter(_vec_cache)))
+    return vec
+
+
+def _max_similarity_in_set(text: str, others: list[str]) -> float:
+    """text 와 others 중 가장 비슷한 것의 코사인 유사도."""
+    vec = _vector_of(text)
+    best = 0.0
+    for other in others:
+        other_vec = _vector_of(other)
+        # 임베딩이 normalize 되어 있어 내적이 곧 코사인 유사도다
+        score = sum(a * b for a, b in zip(vec, other_vec))
+        best = max(best, score)
+    return best
+
+
+async def max_similarity_in_set(text: str, others: list[str]) -> float:
+    """text 가 others 중 가장 비슷한 것과 얼마나 겹치는지 (0.0 ~ 1.0).
+
+    실패 시 0.0 을 반환해 생성을 막지 않는다.
+    """
+    if not others:
+        return 0.0
+    try:
+        return await asyncio.to_thread(_max_similarity_in_set, text, others)
+    except Exception as e:
+        logger.warning(f"세트 내 유사도 계산 실패 - 생략: {e}")
+        return 0.0
+
+
+async def is_duplicate_in_set(text: str, others: list[str]) -> bool:
+    """지금 만들고 있는 세트 안의 다른 문항과 의미가 겹치는지 검사한다.
+
+    is_near_duplicate 는 문자 bigram 유사도라 표현이 다르면 못 잡는다.
+    실측(qwen3.6-35b, 같은 주제 5문제):
+      "ROE에 대한 설명으로 옳은 것은?" vs "ROE의 정의에 대한 설명으로 옳은 것은?"
+      -> 문자 기준 통과, 임베딩 기준 0.979
+      "주가가 상승했을 때 배당수익률의 변화는?" vs "주가가 하락했을 때 ...?"
+      -> 임베딩 기준 0.854
+    3개 주제 30쌍 중 5쌍이 임계값을 넘었는데 하나도 걸러지지 않았다.
+
+    과거 문제 대조(is_duplicate_of_past)와 같은 임계값을 쓴다.
+    같은 '중복'을 판정하는데 기준이 다르면 설명할 수 없다.
+    """
+    score = await max_similarity_in_set(text, others)
+    duplicate = score >= settings.QUIZ_DUP_THRESHOLD
+    logger.info(
+        f"세트 내 유사도 {score:.3f} (임계값 {settings.QUIZ_DUP_THRESHOLD}) "
+        f"-> {'중복 폐기' if duplicate else '통과'}: {text[:35]}"
+    )
+    return duplicate
+
+
 def _count_for_topic(topic: str, user_id: int | None) -> int:
     """해당 주제로 이미 만든 문제 수 (동기, 스레드에서 실행)."""
     _ensure_collection()

@@ -278,10 +278,17 @@ async def generate_quiz_batch(
         answer_pos = answer_pos_for(offset + i + answer_pos_offset(topic))
         question = await generate_quiz(
             user, quiz_type, topic, angle, seen_texts, topic_desc, answer_pos)
-        # 세트 안 중복(문자 유사도) + 과거 요청과의 중복(임베딩 유사도)
+        # 세트 안 중복(문자·의미) + 과거 요청과의 중복
         if await _is_duplicate(question["question_text"], seen_texts, user):
-            question = await generate_quiz(
-                user, quiz_type, topic, angle, seen_texts, topic_desc, answer_pos)
+            # 같은 관점으로 다시 만들면 같은 문제가 또 나온다. 관점을 밀어서 재시도한다.
+            # (실측: ROE 5문제에서 서로 다른 관점인데도 1번과 2번이 유사도 0.979 였다.
+            #  관점 회전만으로는 부족하므로, 최소한 재시도는 다른 관점으로 간다)
+            # 거부된 문제를 avoid 에 넣어야 한다. 안 넣으면 모델이 방금 만든 것을
+            # 피해야 하는지 모른다 (실측: 재시도가 원본과 글자까지 같은 유사도 1.000).
+            retry = await generate_quiz(
+                user, quiz_type, topic, angle_for(offset + i + count),
+                seen_texts + [question["question_text"]], topic_desc, answer_pos)
+            question = await _less_duplicated(question, retry, seen_texts)
         seen_texts.append(question["question_text"])
         questions.append(question)
         gen_args.append((quiz_type, topic, angle, list(seen_texts), topic_desc, answer_pos))
@@ -292,14 +299,35 @@ async def generate_quiz_batch(
     return questions
 
 
-async def _is_duplicate(text: str, seen_texts: list[str], user: UserContext) -> bool:
-    """세트 안 중복(무료) 먼저 보고, 통과하면 과거 문제와 대조한다.
+async def _less_duplicated(first: dict, retry: dict, seen_texts: list[str]) -> dict:
+    """중복으로 걸린 원본과 재시도본 중 세트와 덜 겹치는 쪽을 고른다.
 
-    문자 유사도가 먼저인 이유는 비용이 0이기 때문이다.
-    여기서 걸리면 Qdrant 호출 자체를 아낀다.
+    재시도가 항상 나은 게 아니다. 실측(배당수익률 5문제): 0.846 으로 걸러서
+    다시 만들었더니 0.920 이 나왔다. 재시도본을 무조건 채택하면 오히려 나빠진다.
+    벡터는 캐시되어 있어 추가 임베딩 비용은 재시도본 1건뿐이다.
+    """
+    if not seen_texts:
+        return retry
+    first_score = await bank.max_similarity_in_set(first["question_text"], seen_texts)
+    retry_score = await bank.max_similarity_in_set(retry["question_text"], seen_texts)
+    if retry_score <= first_score:
+        return retry
+    logger.info(
+        f"재시도가 더 겹쳐 원본 유지 (원본 {first_score:.3f} < 재시도 {retry_score:.3f})"
+    )
+    return first
+
+
+async def _is_duplicate(text: str, seen_texts: list[str], user: UserContext) -> bool:
+    """세 단계로 본다: 세트 내 문자 유사도 -> 세트 내 의미 유사도 -> 과거 문제.
+
+    비용이 싼 순서다. 문자 유사도는 0원, 세트 내 임베딩은 CPU 1회,
+    과거 대조는 Qdrant 왕복까지 든다. 앞에서 걸리면 뒤는 건너뛴다.
     """
     if is_near_duplicate(text, seen_texts):
-        logger.info(f"세트 내 중복 감지 - 재생성: {text[:40]}")
+        logger.info(f"세트 내 중복 감지(문자) - 재생성: {text[:40]}")
+        return True
+    if await bank.is_duplicate_in_set(text, seen_texts):
         return True
     return await bank.is_duplicate_of_past(text, user.user_id)
 

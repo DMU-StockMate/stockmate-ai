@@ -460,11 +460,17 @@ async def generate_quiz_from_wrong_answers(
 
         question = await generate(
             user, group["topic"], wrong_context, avoid, angle, answer_pos)
-        # 세트 안 중복(문자 유사도) + 과거 요청과의 중복(임베딩 유사도).
+        # 세트 안 중복(문자·의미) + 과거 요청과의 중복.
         # 그래도 겹치면 그대로 채택한다 (문제 개수는 항상 맞춰야 하므로).
         if await _is_duplicate(question["question_text"], all_texts, user):
-            question = await generate(
-                user, group["topic"], wrong_context, avoid, angle, answer_pos)
+            # 같은 관점으로 다시 만들면 같은 문제가 또 나온다. 관점을 밀어 재시도한다.
+            # 거부된 문제를 avoid 에 넣어야 모델이 그것을 피한다.
+            # 안 넣으면 방금 만든 것을 그대로 다시 내놓는다 (실측 유사도 1.000).
+            retry = await generate(
+                user, group["topic"], wrong_context,
+                avoid + [question["question_text"]],
+                angle_for(slot_index[key] + REVIEW_QUIZ_COUNT), answer_pos)
+            question = await _less_duplicated(question, retry, all_texts)
 
         all_texts.append(question["question_text"])
         generated_by_topic[key].append(question["question_text"])
@@ -485,10 +491,32 @@ async def generate_quiz_from_wrong_answers(
     return questions
 
 
+async def _less_duplicated(first: dict, retry: dict, seen_texts: list[str]) -> dict:
+    """중복으로 걸린 원본과 재시도본 중 세트와 덜 겹치는 쪽을 고른다.
+
+    재시도가 항상 나은 게 아니다 (실측: 0.846 으로 걸렀는데 재시도가 0.920).
+    """
+    if not seen_texts:
+        return retry
+    first_score = await bank.max_similarity_in_set(first["question_text"], seen_texts)
+    retry_score = await bank.max_similarity_in_set(retry["question_text"], seen_texts)
+    if retry_score <= first_score:
+        return retry
+    logger.info(
+        f"재시도가 더 겹쳐 원본 유지 (원본 {first_score:.3f} < 재시도 {retry_score:.3f})"
+    )
+    return first
+
+
 async def _is_duplicate(text: str, seen_texts: list[str], user: UserContext) -> bool:
-    """세트 안 중복(무료) 먼저 보고, 통과하면 과거 문제와 대조한다."""
+    """세 단계로 본다: 세트 내 문자 유사도 -> 세트 내 의미 유사도 -> 과거 문제.
+
+    비용이 싼 순서다. 앞에서 걸리면 뒤는 건너뛴다.
+    """
     if is_near_duplicate(text, seen_texts):
-        logger.info(f"세트 내 중복 감지 - 재생성: {text[:40]}")
+        logger.info(f"세트 내 중복 감지(문자) - 재생성: {text[:40]}")
+        return True
+    if await bank.is_duplicate_in_set(text, seen_texts):
         return True
     return await bank.is_duplicate_of_past(text, user.user_id)
 
