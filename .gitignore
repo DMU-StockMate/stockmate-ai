@@ -11,6 +11,10 @@ lora_weights/
 data/
 chroma_storage/
 
+# 파인튜닝 작업물은 archive/finetune-9b 브랜치에 보관하고 develop 에서는 제외한다.
+# 재개할 때: git checkout archive/finetune-9b -- app/services/quiz/dataset.py
+finetune/
+
 # 로컬 백업 / 비교 실험 산출물
 *.bak
 compare_out/

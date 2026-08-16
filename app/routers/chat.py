@@ -10,6 +10,11 @@ from app.services.rag.chain import (
     stream_rag_chain, stream_general_chain, stream_quiz_chain,
 )
 from app.services.rag.ticker_extractor import extract_tickers, extract_tickers_from_history
+from app.core.logger import setup_logger
+
+# /chat/evaluate 의 예외 핸들러가 logger 를 쓰는데 정의가 없어
+# 에러 발생 시 NameError 로 원래 예외가 가려지고 있었다.
+logger = setup_logger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
