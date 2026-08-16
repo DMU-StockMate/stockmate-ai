@@ -1,4 +1,5 @@
 import asyncio
+import re
 from datetime import datetime, timedelta
 from app.core.llm import build_llm
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -9,6 +10,7 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny, R
 from app.services.rag.vectorstore import get_vectorstore
 from app.services.rag.ticker_extractor import extract_tickers
 from app.services.external.kis import get_stocks_info
+from app.services.external.dart import is_low_info_report
 from app.core.config import settings
 from app.schemas.chat import Message, QuizContext
 from app.core.logger import setup_logger
@@ -106,8 +108,13 @@ QUIZ_PROMPT = ChatPromptTemplate.from_messages([
 
 
 def _get_llm():
-    """RAG 답변용 LLM (temperature 0.3 - 사실 기반이라 낮게)."""
-    return build_llm(temperature=0.3, num_predict=1024, num_ctx=6144)
+    """RAG 답변용 LLM (temperature 0.3 - 사실 기반이라 낮게).
+
+    num_predict 는 1024 였는데, 공시 본문까지 컨텍스트에 들어가면서 답변이 길어져
+    문장 중간에 잘리는 일이 생겼다 (실측: 삼성전자/SK하이닉스 질문 모두 잘림).
+    llama-server 는 -c 16384 로 떠 있어 3072 여유는 충분하다.
+    """
+    return build_llm(temperature=0.3, num_predict=3072, num_ctx=6144)
 
 
 def _convert_history(history: list[Message]) -> list:
@@ -150,6 +157,44 @@ _SOURCE_SEARCH_CONFIG = {
 }
 
 
+# 'score 통과분을 최신순 정렬' 하면, 대형주에서 거의 매일 나오는 임원 소유상황보고서가
+# 자기주식처분결정·잠정실적 같은 핵심 공시를 항상 밀어낸다.
+# (실측: 삼성전자 "최근 공시 중 중요한 거" 질문에 채택된 5건이 전부 임원 소유상황보고서였고,
+#  점수가 더 높은 자기주식처분결정(0.6013)·자기주식처분결과보고서(0.5949)는 탈락했다)
+# 완전히 버리지는 않는다 — 핵심 공시로 자리를 채운 뒤 남는 슬롯에만 넣는다.
+# 유형 판정 기준은 적재(ingestion)와 공유해야 하므로 dart.py 에 둔다.
+
+
+def _dart_title(content: str) -> str:
+    """공시 청크의 첫 줄 "{회사명} 공시: {보고서명}" 에서 보고서명만 뽑는다."""
+    first_line = (content or "").split("\n", 1)[0]
+    return first_line.split("공시:", 1)[-1].strip()
+
+
+def _is_low_info_dart(content: str) -> bool:
+    return is_low_info_report(_dart_title(content))
+
+
+def _order_for_take(items: list, source: str, get_content, get_published) -> list:
+    """관련성 통과분을 '채택 순서'로 정렬한다.
+
+    dart 는 핵심 공시 → 저정보 공시 2계층으로 나눈 뒤 각 계층 안에서 최신순으로 본다.
+    나머지 source(뉴스/재무)는 유형별 중요도 편차가 없으므로 기존대로 최신순만 본다.
+    """
+    def recency(x):
+        return get_published(x) or 0
+
+    if source != "dart":
+        return sorted(items, key=recency, reverse=True)
+
+    primary, demoted = [], []
+    for x in items:
+        (demoted if _is_low_info_dart(get_content(x)) else primary).append(x)
+    primary.sort(key=recency, reverse=True)
+    demoted.sort(key=recency, reverse=True)
+    return primary + demoted
+
+
 async def _search_source(vs, question: str, tickers: list[str], source: str, cfg: dict) -> list:
     """특정 source(news/dart/financials) 안에서만 유사도 검색 후 최신순으로 재정렬한다.
 
@@ -181,9 +226,13 @@ async def _search_source(vs, question: str, tickers: list[str], source: str, cfg
     # 유사도 임계값 미만 문서는 버린다 (관련성 없는 문서가 최신순 정렬로 채택되는 것 방지).
     min_score = cfg.get("min_score", 0.0)
     docs = [doc for doc, score in results if score >= min_score]
-    # 관련성 통과분 안에서 최신순으로 재정렬 후 상위 take개 채택.
-    docs.sort(key=lambda d: d.metadata.get("published_at", 0), reverse=True)
-    return docs[: cfg["take"]]
+    # 관련성 통과분을 채택 순서(dart는 중요도 계층 → 최신순)로 정렬 후 상위 take개 채택.
+    ordered = _order_for_take(
+        docs, source,
+        get_content=lambda d: d.page_content,
+        get_published=lambda d: d.metadata.get("published_at"),
+    )
+    return ordered[: cfg["take"]]
 
 
 class _MultiSourceRetriever:
@@ -241,14 +290,16 @@ async def _search_source_debug(vs, question: str, tickers: list[str], source: st
             "published_at": doc.metadata.get("published_at"),
             "passed_score": float(score) >= min_score,
             "taken": False,
+            # 저정보 공시로 분류돼 후순위로 밀렸는지. 왜 안 뽑혔는지 디버깅용.
+            "low_info": source == "dart" and _is_low_info_dart(doc.page_content),
             "content": doc.page_content,
         })
 
-    # 실제 채택 로직과 동일: score 통과분을 최신순 정렬 후 상위 take개만 taken=True.
-    passed = sorted(
-        [r for r in records if r["passed_score"]],
-        key=lambda r: r["published_at"] or 0,
-        reverse=True,
+    # 실제 채택 로직과 동일: score 통과분을 채택 순서로 정렬 후 상위 take개만 taken=True.
+    passed = _order_for_take(
+        [r for r in records if r["passed_score"]], source,
+        get_content=lambda r: r["content"],
+        get_published=lambda r: r["published_at"],
     )
     for r in passed[: cfg["take"]]:
         r["taken"] = True

@@ -6,7 +6,10 @@ from email.utils import parsedate_to_datetime
 from langchain_core.documents import Document
 from app.services.rag.vectorstore import get_vectorstore
 from app.services.external.naver_news import search_news
-from app.services.external.dart import get_disclosures, get_financial_statements, get_disclosure_document
+from app.services.external.dart import (
+    get_disclosures, get_financial_statements, get_disclosure_document, is_low_info_report,
+    format_krw_human,
+)
 from app.core.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -53,29 +56,8 @@ def _make_id(text: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, text))
 
 
-def _format_krw_human(amount_str: str) -> str:
-    """"306,220,075,000,000" 같은 원 단위 문자열을 "약 306.22조원"처럼 사람이 읽기 쉬운 형태로 변환.
-
-    LLM에게 큰 원화 숫자를 그대로 주고 조/억 단위 변환을 맡기면 자릿수를 잘못 읽어
-    1000배씩 틀리는 경우가 실측(RAGAS faithfulness 평가)에서 확인됐다. 여기서 미리 변환해
-    컨텍스트에 함께 넣어주면 LLM이 계산 대신 그대로 인용만 하면 되어 오류가 줄어든다.
-    """
-    try:
-        amount = int(str(amount_str).replace(",", ""))
-    except (ValueError, TypeError):
-        return ""
-
-    JO = 1_000_000_000_000  # 1조
-    EOK = 100_000_000  # 1억
-
-    sign = "-" if amount < 0 else ""
-    abs_amount = abs(amount)
-
-    if abs_amount >= JO:
-        return f"약 {sign}{abs_amount / JO:,.2f}조원"
-    if abs_amount >= EOK:
-        return f"약 {sign}{abs_amount / EOK:,.1f}억원"
-    return f"{sign}{abs_amount:,}원"
+# 공시 본문(dart.py)에서도 같은 변환이 필요해져 dart.py 로 옮겼다. 호출부 호환용 별칭.
+_format_krw_human = format_krw_human
 
 
 def _parse_pub_date(pub_date: str) -> int | None:
@@ -178,9 +160,15 @@ async def ingest_disclosures(ticker: str, days: int = 90) -> int:
         return 0
 
     # 2) 새 공시의 원문 본문을 병렬로 조회 (실패 시 빈 문자열 → 제목만 저장)
-    bodies = await asyncio.gather(
-        *[get_disclosure_document(item["rcept_no"]) for item, _ in new_items]
-    )
+    #    저정보 공시(임원 개인의 수백 주 매매 보고서 등)는 본문을 받지 않는다.
+    #    검색에서 어차피 후순위로 밀려 컨텍스트에 들어갈 일이 거의 없는데,
+    #    page_count 를 100 으로 올린 뒤로는 이 유형이 대부분이라 원문 조회가 그만큼 낭비된다.
+    async def _body(item: dict) -> str:
+        if is_low_info_report(item["title"]):
+            return ""
+        return await get_disclosure_document(item["rcept_no"])
+
+    bodies = await asyncio.gather(*[_body(item) for item, _ in new_items])
 
     # 3) 제목·날짜 + (있으면) 본문을 담아 Document 구성.
     #    제목만 있던 기존 방식은 LLM이 '공시 내용'을 지어내게 만들었다 - 본문을 근거로 제공한다.
