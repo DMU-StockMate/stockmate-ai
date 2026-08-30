@@ -444,6 +444,89 @@ Invoke-RestMethod "https://api.runpod.io/v2/pods/<POD_ID>" -Method Delete -Heade
 | 다운로드가 다시 돎 | 리전 불일치 또는 `HF_HOME` 누락 | 볼륨이 AP-JP-1 인지, env 확인 |
 | Start Command 수정 필요 | — | 파드에서는 불가. 템플릿 고치고 **파드 재생성** |
 
+## 8-0. 재배포 체크리스트 — 새 대화에서도 이대로 하면 된다
+
+로컬에서 코드를 고친 뒤 서버에 반영하는 전체 절차다. **이 문서만 보고 실행 가능해야 한다.**
+값들은 저장소의 `.env`(앱 설정)와 `.env.runpod`(RunPod 자격증명·ID)에 있다.
+
+### 0. 이 절차가 필요한 때
+
+앱 코드가 이미지에 구워져 있으므로 **로컬 코드 변경은 재빌드 없이는 서버에 반영되지 않는다.**
+다만 매번 할 필요는 없다 — 일상 개발은 로컬 FastAPI + OpenRouter 로 하고,
+배포는 베타 직전 / 피드백 반영 후 / 발표 전 동결 정도로 두세 번이면 충분하다.
+
+### 1. 버전 정하기
+
+**태그를 절대 덮어쓰지 말 것.** 항상 올린다. 현재까지: `0.1.0` → `0.1.1` → `0.1.2`.
+
+### 2. 튜닝 값 동기화 (빠뜨리기 쉬움)
+
+로컬 `.env` 에서 `LLM_REASONING_EFFORT`, `LLM_MAX_TOKENS`, `EMBEDDING_DEVICE` 등을
+바꿔서 좋아졌다면, **`Dockerfile` 의 ENV 블록에도 같은 값을 반영**한 뒤 빌드한다.
+Dockerfile 이 이 값들의 단일 출처다. 안 맞추면 "로컬에선 되는데 서버에선 안 되는"
+가장 찾기 어려운 버그가 된다.
+
+`.env` 의 비밀값(API 키)은 RunPod 템플릿 env 에 따로 들어 있다. 키를 재발급했다면
+템플릿 env 도 갱신할 것.
+
+### 3. 빌드 · 푸시
+
+```powershell
+cd C:\Users\dhp13\Desktop\stockmate-ai
+docker build -t dohun1214/stockmate-ai:<새버전> .
+docker push dohun1214/stockmate-ai:<새버전>
+```
+
+빌드 게이트 3개가 로그에 보여야 한다: `vllm 0.28.0` / `app deps ok` / `app.main import ok`.
+베이스 캐시가 있으면 빌드 3분, 푸시 2~5분(앱 레이어만 올라감).
+
+### 4. 템플릿 갱신
+
+RunPod 템플릿 `c3bqwiolqi`(`stockmate-fullstack`)의 이미지를 새 태그로 바꾼다.
+MCP `update-template` 또는 콘솔. **`args` 는 비워둔 채로 유지한다** (이미지 ENTRYPOINT 가 처리).
+
+### 5. 파드 생성
+
+```powershell
+$key = ((Get-Content .env.runpod | Select-String '^RUNPOD_API_KEY=').Line -replace '^RUNPOD_API_KEY=','')
+$body = @{
+  name='stockmate'; templateId='c3bqwiolqi'
+  gpu=@{ id='NVIDIA H100 80GB HBM3'; count=1 }
+  dataCenterIds=@('AP-JP-1'); cloud='SECURE'
+  mounts=@{ network=@(@{ volumeId='htdeoj8rmu'; path='/workspace' }) }
+} | ConvertTo-Json -Depth 6
+(Invoke-RestMethod 'https://api.runpod.io/v2/pods' -Method Post `
+   -ContentType 'application/json' -Headers @{Authorization="Bearer $key"} -Body $body).id
+```
+
+**MCP `create-pod` 는 쓰지 말 것** — Network Volume 을 붙이지 못한다.
+
+### 6. 검증 (약 7분 뒤)
+
+로그에서 순서대로 확인:
+`Qdrant 준비 완료` → `Loading weights took ~55s` → `vLLM 준비 완료` →
+`DART 종목 코드 로드 완료` → `임베딩 모델 워밍업 완료 (~18s, device=cuda)` → `Uvicorn running`
+
+스모크:
+```powershell
+$u='https://<POD_ID>-8080.proxy.runpod.net'
+Invoke-RestMethod "$u/health"
+```
+
+### 7. 끝나면 삭제
+
+```powershell
+Invoke-RestMethod "https://api.runpod.io/v2/pods/<POD_ID>" -Method Delete -Headers @{Authorization="Bearer $key"}
+```
+
+### 알아둘 것
+
+- 로컬에서 git 명령을 쓸 때 Cowork VM(`device_bash`)은 `.git/index.lock` 을 지우지
+  못한다. **git 은 Windows PowerShell 에서 실행할 것.**
+- 커밋 메시지에 한글이 있으면 BOM 없는 UTF-8 파일로 쓰고 `git commit -F` 를 쓴다.
+  PowerShell 5.1 은 BOM 없는 UTF-8 **스크립트**는 CP949 로 읽으므로, 스크립트 파일은
+  반대로 BOM 을 넣어야 한다.
+
 ## 8-1. (v1 기록) 앱이 로컬에 남아 있던 구성 — 지금은 §8-2 로 대체됨
 
 **H100 파드에 올라간 것은 LLM 하나뿐이다.** 이 프로젝트의 코드나 데이터는

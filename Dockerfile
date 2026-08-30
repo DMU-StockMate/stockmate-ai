@@ -62,8 +62,14 @@ RUN python3 -c "import vllm; print('vllm', vllm.__version__)" \
  && python3 -c "import app.main; print('app.main import ok')"
 
 # ---------------------------------------------------------------------------
-# 기본값. 비밀값(API 키)은 넣지 않는다 — 이미지가 public 이다.
-# 파드 생성 시 env 로 주입한다.
+# 런타임 기본값.
+#
+# **튜닝 값(LLM_*, VLLM_*, EMBEDDING_DEVICE)의 단일 출처는 여기다.**
+# 로컬 .env 에서 값을 바꿔 좋아졌다면 여기도 같이 고치고 다시 빌드해야
+# 서버에 반영된다. RunPod 템플릿 env 는 비밀값만 담는 것을 원칙으로 한다
+# (템플릿에 같은 키를 넣으면 이 값을 덮어쓰므로 드리프트의 원인이 된다).
+#
+# 비밀값(API 키)은 넣지 않는다 — 이미지가 public 이다. 파드 env 로 주입한다.
 # ---------------------------------------------------------------------------
 ENV HF_HOME=/workspace/hf \
     QDRANT_STORAGE=/workspace/qdrant_storage \
@@ -74,7 +80,7 @@ ENV HF_HOME=/workspace/hf \
     LLM_MODEL=qwen3.8-27b \
     LLM_DISABLE_THINKING=False \
     LLM_REASONING_EFFORT=medium \
-    LLM_MAX_TOKENS=2048 \
+    LLM_MAX_TOKENS=4096 \
     \
     QDRANT_HOST=127.0.0.1 \
     QDRANT_PORT=6333 \
