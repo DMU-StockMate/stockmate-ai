@@ -79,6 +79,10 @@ QUALITY_RULES = """- 문제는 반드시 한 문장으로 짧고 명확하게 �
 - 모든 텍스트는 자연스러운 한국어로 작성하세요.
   영어 단어를 그대로 섞어 쓰지 마세요 (PER, EPS, ROE 같은 지표 약어는 허용).
   (나쁜 예: "실적 alone 이 좋아도 valuation 의 숫자는 낮아집니다")
+  원어를 밝혀야 하면 괄호 안에만 쓰세요. (좋은 예: "EPS(주당순이익)")
+- 계산식은 수식 기호 없이 한국어 문장으로 쓰세요.
+  달러 기호나 역슬래시 명령(\\frac, \\text 등)은 화면에 그대로 노출됩니다.
+  (좋은 예: "PER은 주가를 주당순이익으로 나눈 값입니다")
 - 문제 지문의 전제와 정답이 서로 모순되면 절대 안 됩니다.
   (나쁜 예: "이익이 일정하게 유지된다고 가정할 때"라고 전제해놓고
    정답이 "이익이 증가했기 때문"인 문제)
@@ -305,6 +309,18 @@ def format_avoid_block(texts: list[str]) -> str:
 # 판정 자체는 옳았지만("베타"로 써야 함) 학습 데이터의 reject_reason 이 부정확해진다.
 _LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
 
+# 원어 병기 괄호. "EPS(Earnings Per Share, 주당순이익)" 처럼 괄호 안에 원어를
+# 밝히는 것은 교육 문맥에서 정당하고, 오히려 초급자에게 도움이 된다.
+# 반면 실측으로 잡으려던 결함("실적 alone 이 좋아도 valuation 의 숫자는")은
+# 괄호 밖에 있다. 그래서 괄호 안은 검사 대상에서 뺀다.
+# 단 괄호 안이 길면 병기가 아니라 영어 문장을 숨긴 것이므로 그대로 검사한다.
+_PAREN_GLOSS = re.compile(r"[(（][^()（）]{0,40}[)）]")
+
+# LaTeX 수식 표기. 프런트가 렌더링하지 않아 화면에 날것으로 노출되므로 거부한다.
+# 이전에는 \frac, \text 가 _LATIN_WORD 에 걸려 "영어 단어 혼입"으로 보고됐다.
+# 판정은 옳았지만 사유가 틀려서, 학습 데이터의 reject_reason 이 오염됐다.
+_LATEX = re.compile(r"\$\$.*?\$\$|\$[^$\n]+\$|\\[a-zA-Z]+", re.S)
+
 # 한자·일본어 가나 혼입. Qwen 계열에서 자주 나온다
 # (실측: "주가 상승률이 항상 높은 公司股票").
 # 한국 주식 교육 문맥에서 한자·가나가 정당하게 쓰일 일은 없으므로 전부 거부한다.
@@ -318,8 +334,18 @@ _LEARNER_REFERENCES = (
 
 
 def assert_korean(text: str, where: str = "텍스트") -> None:
-    """한국어 문장에 영어·한자·가나가 섞였으면 AssertionError."""
-    for m in _LATIN_WORD.finditer(text):
+    """한국어 문장에 영어·한자·가나가 섞였으면 AssertionError.
+
+    괄호 안의 원어 병기는 허용한다 - "EPS(주당순이익)" 는 결함이 아니다.
+    수식 표기는 영어 혼입이 아니라 별도 사유로 거부해, 거절 사유가
+    실제 결함과 일치하게 한다.
+    """
+    latex = _LATEX.search(text)
+    if latex:
+        raise AssertionError(f"{where}에 수식 표기 혼입: {latex.group()[:20]}")
+
+    scan = _PAREN_GLOSS.sub(" ", text)  # 원어 병기 구간 제외
+    for m in _LATIN_WORD.finditer(scan):
         word = m.group()
         if word.isupper():  # PER, EPS, ROE, ETF, OX 등 약어는 허용
             continue
