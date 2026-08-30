@@ -18,3 +18,4 @@ finetune/
 # 로컬 백업 / 비교 실험 산출물
 *.bak
 compare_out/
+*_coverage_report.txt
