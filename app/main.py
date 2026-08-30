@@ -20,8 +20,33 @@ async def lifespan(app: FastAPI):
     logger.info("서버 시작 중...")
     await load_corp_codes()
     logger.info("DART 종목 코드 로드 완료")
+    await _warm_up()
     yield
     logger.info("서버 종료")
+
+
+async def _warm_up() -> None:
+    """임베딩 모델을 미리 올린다.
+
+    bge-m3 는 첫 사용 시점에 지연 로딩되는데, 서버(GPU)에서 40초쯤 걸린다.
+    그 비용을 첫 사용자의 요청이 뒤집어쓰면 RunPod HTTP 프록시의 80초 제한에
+    걸려 500 이 나간다 (2026-08-30 리허설 실측: 서버는 86초에 정상 완료했는데
+    클라이언트는 79.7초에 500 수신). 기동 시점에 미리 올려 그 창을 없앤다.
+
+    실패해도 서버는 떠야 한다 - 첫 요청이 느려질 뿐 기능은 동작한다.
+    """
+    import asyncio
+
+    try:
+        from app.services.rag.vectorstore import get_embeddings
+
+        started = asyncio.get_running_loop().time()
+        embeddings = await asyncio.to_thread(get_embeddings)
+        await asyncio.to_thread(embeddings.embed_query, "워밍업")
+        elapsed = asyncio.get_running_loop().time() - started
+        logger.info(f"임베딩 모델 워밍업 완료 ({elapsed:.1f}s, device={settings.EMBEDDING_DEVICE})")
+    except Exception as e:
+        logger.warning(f"임베딩 워밍업 실패 - 첫 요청이 느려질 수 있다: {e}")
 
 
 app = FastAPI(title="StockMate AI", version="0.1.0", lifespan=lifespan)
