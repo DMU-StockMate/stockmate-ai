@@ -257,7 +257,20 @@ async def generate_ox_question(
                 "level": user.investment_level,
             }
         except Exception as e:
+            # 재시도 사유를 반드시 남긴다. 남기지 않으면 서버 로그에 LLM 호출만
+            # 반복해서 찍히고 왜 실패했는지는 어디에도 안 남는다 (2026-08-30 실측:
+            # MULTIPLE_CHOICE + 중급 이 3회 소진으로 500 이 났는데 원인 추적 불가).
+            # 최종 실패는 라우터가 HTTPException 으로 바꿔 던져 전역 핸들러를
+            # 타지 않으므로, 여기서 로그를 남기지 않으면 영영 알 수 없다.
+            logger.warning(
+                f"OX 생성 시도 {attempt + 1}/3 실패 "
+                f"(topic={topic}, level={user.investment_level}): {type(e).__name__}: {e}"
+            )
             if attempt == 2:
+                logger.error(
+                    f"OX 생성 3회 소진 - 500 반환 "
+                    f"(topic={topic}, level={user.investment_level}): {e}"
+                )
                 raise ValueError(f"OX 문제 생성 실패: {e}")
             continue
 
@@ -309,7 +322,20 @@ async def generate_mc_question(
                 "level": user.investment_level,
             }
         except Exception as e:
+            # 재시도 사유를 반드시 남긴다. 남기지 않으면 서버 로그에 LLM 호출만
+            # 반복해서 찍히고 왜 실패했는지는 어디에도 안 남는다 (2026-08-30 실측:
+            # MULTIPLE_CHOICE + 중급 이 3회 소진으로 500 이 났는데 원인 추적 불가).
+            # 최종 실패는 라우터가 HTTPException 으로 바꿔 던져 전역 핸들러를
+            # 타지 않으므로, 여기서 로그를 남기지 않으면 영영 알 수 없다.
+            logger.warning(
+                f"객관식 생성 시도 {attempt + 1}/3 실패 "
+                f"(topic={topic}, level={user.investment_level}): {type(e).__name__}: {e}"
+            )
             if attempt == 2:
+                logger.error(
+                    f"객관식 생성 3회 소진 - 500 반환 "
+                    f"(topic={topic}, level={user.investment_level}): {e}"
+                )
                 raise ValueError(f"객관식 문제 생성 실패: {e}")
             continue
 
