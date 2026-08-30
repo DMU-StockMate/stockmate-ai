@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     QUIZ_DUP_THRESHOLD: float = 0.83
 
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
+    # 임베딩 실행 장치. 로컬(4060 Ti 8GB)은 VRAM 을 LLM 이 다 쓰므로 cpu,
+    # 서버(H100)는 vLLM 이 0.88 만 잡고 남는 자리에 올릴 수 있어 cuda.
+    # bge-m3 는 CPU 에서 1회 50~200ms 인데, 중복 검사가 문항 수의 제곱으로
+    # 호출되므로(bank.py) 서버에서는 이게 실질 병목이 된다.
+    EMBEDDING_DEVICE: str = "cpu"
     DART_API_KEY: str = ""
     NAVER_CLIENT_ID: str = ""
     NAVER_CLIENT_SECRET: str = ""
