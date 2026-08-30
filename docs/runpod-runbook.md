@@ -455,6 +455,32 @@ Invoke-RestMethod "https://api.runpod.io/v2/pods/<POD_ID>" -Method Delete -Heade
 다만 매번 할 필요는 없다 — 일상 개발은 로컬 FastAPI + OpenRouter 로 하고,
 배포는 베타 직전 / 피드백 반영 후 / 발표 전 동결 정도로 두세 번이면 충분하다.
 
+### 개발 중에 이 두 가지만 지키면 배포가 순조롭다
+
+기능 개발은 다른 세션에서 하더라도, 아래 두 가지는 그때 같이 해두어야 한다.
+빠뜨리면 배포 시점에 발견되고 재빌드로 15분씩 날아간다.
+
+| 개발 중 한 일 | 같이 해야 할 일 |
+|---|---|
+| 파이썬 패키지 추가 (`uv add ...`) | **`requirements-server.txt` 에도 추가** |
+| `.env` 에서 튜닝 값 변경 (`LLM_REASONING_EFFORT`, `LLM_MAX_TOKENS`, `EMBEDDING_DEVICE`) | **`Dockerfile` ENV 블록에도 반영** |
+| API 키 재발급 | RunPod 템플릿 `c3bqwiolqi` 의 env 도 갱신 |
+
+패키지 누락은 Dockerfile 끝의 `import app.main` 게이트가 빌드에서 잡아준다
+(파드가 아니라 빌드에서 실패하는 것이 설계 의도다). 튜닝 값 불일치는 아무도
+잡아주지 않으니 사람이 챙겨야 한다.
+
+### 일상 개발 환경 (참고)
+
+```powershell
+docker start qdrant                     # 컨테이너 이름 qdrant, 재시작 정책 없음
+uv run uvicorn app.main:app --reload
+```
+
+LLM 은 `.env` 가 OpenRouter(`qwen/qwen3.8-27b`)를 보고 있다. 유휴 비용 0,
+퀴즈 1건 약 $0.006. 서버와 같은 모델이라 품질 판단에 그대로 쓸 수 있다.
+로컬 llama-server 로 되돌리려면 `.env` 의 롤백용 주석 블록 참고.
+
 ### 1. 버전 정하기
 
 **태그를 절대 덮어쓰지 말 것.** 항상 올린다. 현재까지: `0.1.0` → `0.1.1` → `0.1.2`.
