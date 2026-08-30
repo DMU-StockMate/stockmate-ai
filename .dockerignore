@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+**/__pycache__
+chroma_storage
+compare_out
+_to_delete
+*.log
+.env
+.env.*
+docs/index.html
+category_coverage_report.txt

@@ -1,0 +1,11 @@
+# 파드 안에서만 쓰는 Qdrant 설정.
+# 외부로 열지 않는다 - FastAPI 가 같은 컨테이너의 127.0.0.1 로만 붙는다.
+storage:
+  storage_path: /workspace/qdrant_storage
+  snapshots_path: /workspace/qdrant_storage/snapshots
+service:
+  host: 127.0.0.1
+  http_port: 6333
+  grpc_port: 6334
+telemetry_disabled: true
+log_level: INFO
