@@ -47,6 +47,76 @@ def get_catalog_for_level(investment_level: str) -> "list[QuizCategoryIn]":
     return [c for c in QUIZ_CATEGORY_CATALOG if c.investment_level == catalog_level]
 
 
+# =========================================================
+# 카탈로그 조회 (문제 생성 프롬프트에 넣을 설명·출제 방향을 꺼내는 헬퍼)
+# =========================================================
+
+def get_category(category_code: str | None) -> "QuizCategoryIn | None":
+    """category_code로 카테고리를 찾는다. 없으면 None."""
+    if not category_code:
+        return None
+    return next(
+        (c for c in QUIZ_CATEGORY_CATALOG if c.category_code == category_code), None
+    )
+
+
+def get_detail_description(category_code: str | None, detail_code: str | None) -> str:
+    """상세 코드의 설명을 돌려준다. 없으면 빈 문자열.
+
+    문제 생성 프롬프트의 주제 힌트로는 **카테고리 설명이 아니라 상세 설명**을 쓴다.
+    카테고리 설명은 형제 주제를 나열하므로("PER, ROE, EPS, PBR"),
+    topic이 PER일 때 그대로 넣으면 오히려 ROE로 새라고 부추기는 꼴이 된다.
+    상세 설명("주가수익비율의 의미")은 그 주제 하나로 범위를 좁혀준다.
+    """
+    cat = get_category(category_code)
+    if not cat or not detail_code:
+        return ""
+    detail = next((d for d in cat.details if d.detail_code == detail_code), None)
+    return (detail.description or "") if detail else ""
+
+
+def get_problem_direction(category_code: str | None) -> str:
+    """카테고리의 출제 방향("주식 용어 이해" 등). 없으면 빈 문자열."""
+    cat = get_category(category_code)
+    return (cat.problem_direction or "") if cat else ""
+
+
+def _norm(text: str) -> str:
+    """공백을 지워 "볼린저 밴드"와 "볼린저밴드"를 같게 본다."""
+    return "".join(text.split())
+
+
+def find_topic_context(topic: str, investment_level: str = "") -> tuple[str, str]:
+    """주제명만 아는 경우(/quiz/generate)에 카탈로그에서 문맥을 찾아준다.
+
+    반환: (주제 설명, 출제 방향). 못 찾으면 ("", "").
+
+    프롬프트 기반 생성(/quiz/generate/prompt)은 LLM이 category_code를 정해주지만,
+    /quiz/generate는 topic 문자열만 받는다. 그 경로에서도 카테고리의 출제 방향을
+    쓸 수 있도록 이름으로 결정론적으로 매칭한다 (LLM 호출 없음).
+
+    사용자 등급의 카탈로그를 먼저 보고, 없으면 전체 카탈로그에서 찾는다.
+    같은 이름의 상세가 여러 등급에 있을 때(예: "RSI") 사용자 등급 것을 고르기 위함이다.
+    """
+    if not topic:
+        return "", ""
+
+    target = _norm(topic)
+    level_catalog = get_catalog_for_level(investment_level) if investment_level else []
+    # 등급 카탈로그 -> 전체 카탈로그 순으로 본다 (앞에서 찾으면 거기서 멈춤)
+    for catalog in (level_catalog, QUIZ_CATEGORY_CATALOG):
+        for cat in catalog:
+            for d in cat.details:
+                if _norm(d.detail_name) == target:
+                    return d.description or "", cat.problem_direction or ""
+        # 상세에 없으면 카테고리 이름으로 찾는다.
+        # 이 경우엔 카테고리 자체가 주제이므로 형제 나열(description)이 오히려 정확하다.
+        for cat in catalog:
+            if _norm(cat.category_name) == target:
+                return cat.description or "", cat.problem_direction or ""
+    return "", ""
+
+
 QUIZ_CATEGORY_CATALOG: list[QuizCategoryIn] = [
     # ----- 초급 (investment_level_id=1) -----
     _cat("초급", "BEGINNER_STOCK_BASIC", "주식 기본 개념",

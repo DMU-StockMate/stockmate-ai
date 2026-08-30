@@ -6,6 +6,11 @@ from app.schemas.chat import UserContext
 from app.schemas.quiz import QuizCategoryIn
 from app.core.logger import setup_logger
 from app.services.quiz import bank
+from app.services.quiz.categories import (
+    find_topic_context,
+    get_detail_description,
+    get_problem_direction,
+)
 from app.services.quiz.quality import (
     ANGLE_BLOCK,
     ANSWER_POSITION_BLOCK,
@@ -46,6 +51,79 @@ LEVEL_GUIDE = {
     "미설정": "기본 개념을 아는 사람. 문제는 간단하게.",
 }
 
+
+# 등급별 문제 '구조' 지시 (학습 기준표의 목적 / 데이터 난이도 / 판단 방식 / 문제 형태).
+#
+# LEVEL_GUIDE 가 "어느 수준까지 깊이 들어갈지"를 말한다면, 여기는 "문제를 어떤 모양으로
+# 만들지"를 말한다. 초급은 정보 1개로 정답이 명확하게, 중급은 정보 2~3개를 비교해서,
+# 고급은 여러 자료를 놓고 근거의 타당성으로 갈리게 만든다.
+#
+# ⚠️ LEVEL_GUIDE 와 같은 이유로 여기에도 구체적인 지표명(PER, ROE 등)을 쓰면 안 된다.
+# 지표명을 넣으면 주제가 "주식"이어도 모델이 그 지표로 새버린다(실측 이탈률 32%).
+# 그래서 예시 형태는 개념 자리를 "(개념)", "(상황)" 으로 비워두고 문장 모양만 보여준다.
+LEVEL_STYLE = {
+    "입문": """- 목적: 투자 기본 개념을 익히게 하는 것입니다.
+- 제시 정보: 정보를 하나만 제시하세요. 두 가지 이상을 조합하게 만들지 마세요.
+- 판단 방식: 정답이 분명하게 갈리도록 만드세요.
+- 문제 형태 예시 (모양만 참고하고 그대로 베끼지 마세요):
+  "(개념)에 대한 설명으로 옳은 것은?" 처럼 용어의 뜻을 바로 묻는 형태.""",
+
+    "초급": """- 목적: 용어와 기본 판단 기준을 익히게 하는 것입니다.
+- 제시 정보: 정보를 하나만 제시하세요. 여러 정보를 조합해야 풀리는 문제는 만들지 마세요.
+- 판단 방식: 정답이 비교적 명확하게 갈리도록 만드세요.
+- 문제 형태 예시 (모양만 참고하고 그대로 베끼지 마세요):
+  "(개념)이 낮다는 것은 일반적으로 어떤 의미인가?"
+  "(개념)이 높을수록 어떤 점에서 긍정적인가?"
+  "(상품)은 (다른 상품)보다 일반적으로 위험이 높은가 낮은가?" """,
+
+    "중급": """- 목적: 여러 정보를 조합해서 투자 판단을 하게 하는 것입니다.
+- 제시 정보: 서로 다른 정보를 2~3개 함께 제시하세요.
+  (예: 가격 흐름과 재무 상태를 함께, 또는 재무 상태와 뉴스를 함께)
+- 판단 방식: 단순 암기가 아니라 근거들을 비교해서 고르게 만드세요.
+- 단, **제시하는 정보가 여러 개여도 질문은 하나여야 합니다.**
+  상황 설명에 정보를 여러 개 담되, 마지막에 묻는 것은 하나로 좁히세요.
+- 문제 형태 예시 (모양만 참고하고 그대로 베끼지 마세요):
+  "A기업은 (상황1)이고 (상황2)이지만 (상황3)이다. 가장 적절한 판단은?"
+  "(사건)이 있었지만 이미 (상황)이라면 어떤 위험이 있는가?" """,
+
+    "고급": """- 목적: 실제 투자 전략을 세우고 리스크까지 판단하게 하는 것입니다.
+- 제시 정보: 여러 자료를 복합적으로 제시하세요.
+  (예: 가격 흐름과 재무 상태와 공시·뉴스를 한 상황 안에 함께)
+- 판단 방식: 정답 하나를 외워서 맞히는 문제가 아니라 근거의 타당성에서 갈리는
+  문제로 만드세요. 오답도 언뜻 그럴듯해 보이게 쓰되, 실제로는 틀린 내용이어야 합니다.
+- 단, **제시하는 자료가 여러 개여도 질문은 하나여야 합니다.**
+  상황 설명에 자료를 여러 개 담되, 마지막에 묻는 것은 하나로 좁히세요.
+- 문제 형태 예시 (모양만 참고하고 그대로 베끼지 마세요):
+  "(시점) 당시 정보만으로 판단할 때 매수·보유·매도 중 가장 적절한 것은?"
+  "(긍정 요인)이 있지만 (부정 요인)도 함께 있을 때 가장 적절한 전략은?" """,
+
+    "미설정": """- 목적: 투자 기본 개념을 익히게 하는 것입니다.
+- 제시 정보: 정보를 하나만 제시하세요.
+- 판단 방식: 정답이 비교적 명확하게 갈리도록 만드세요.""",
+}
+
+
+def level_style_for(investment_level: str) -> str:
+    """사용자 등급에 맞는 문제 구조 지시. 모르는 등급이면 미설정 기준."""
+    return LEVEL_STYLE.get(investment_level, LEVEL_STYLE["미설정"])
+
+
+def format_direction_block(direction: str) -> str:
+    """카테고리의 출제 방향을 프롬프트 조각으로 만든다. 없으면 빈 문자열.
+
+    카탈로그의 problem_direction("주식 용어 이해", "차트 흐름을 단순 해석" 등)은
+    그동안 categories.py 에 데이터로만 있고 실제 생성 프롬프트에는 전달되지 않았다.
+    같은 주제라도 카테고리가 의도한 방향이 다르므로(예: 중급 "보조지표 개념"은
+    지표의 의미를, 고급 "보조지표 활용 판단"은 매매 판단을 묻는다) 여기서 넣어준다.
+    """
+    if not direction:
+        return ""
+    return (
+        f"- 출제 방향: {direction}\n"
+        f"  이 방향에 맞는 문제를 만드세요. 같은 주제라도 이 방향에서 벗어나면 안 됩니다.\n"
+    )
+
+
 OX_TOPICS = [
     "PER", "PBR", "ROE", "EPS", "배당", "시가총액",
     "코스피", "코스닥", "ETF", "공매도", "분산투자",
@@ -68,7 +146,11 @@ MC_PROMPT = ChatPromptTemplate.from_template("""
 조건:
 - 주제: {topic}{topic_hint}
   이 주제의 범위를 벗어나지 마세요. 다른 지표나 개념을 주인공으로 삼으면 안 됩니다.
-- 난이도: {level} ({level_guide})
+{direction_block}- 난이도: {level} ({level_guide})
+
+[이 난이도에서 문제를 만드는 방식]
+{level_style}
+
 """ + QUALITY_RULES + """
 """ + MC_QUALITY_RULES + """
 - 해설은 정답이 왜 맞고 오답이 왜 틀린지 설명하세요.
@@ -112,7 +194,11 @@ OX_PROMPT = ChatPromptTemplate.from_template("""
 조건:
 - 주제: {topic}{topic_hint}
   이 주제의 범위를 벗어나지 마세요. 다른 지표나 개념을 주인공으로 삼으면 안 됩니다.
-- 난이도: {level} ({level_guide})
+{direction_block}- 난이도: {level} ({level_guide})
+
+[이 난이도에서 문제를 만드는 방식]
+{level_style}
+
 """ + QUALITY_RULES + """
 """ + OX_QUALITY_RULES + """
 - 해설은 왜 그 답이 맞는지 설명하세요.
@@ -136,7 +222,7 @@ def _get_random_topic(quiz_type: str) -> str:
 
 async def generate_ox_question(
     user: UserContext, topic: str, angle: str = "", avoid: list[str] | None = None,
-    topic_desc: str = "",
+    topic_desc: str = "", direction: str = "",
 ) -> dict:
     level_guide = LEVEL_GUIDE.get(user.investment_level, LEVEL_GUIDE["미설정"])
     chain = OX_PROMPT | _get_llm()
@@ -144,10 +230,12 @@ async def generate_ox_question(
         "topic": topic,
         "level": user.investment_level,
         "level_guide": level_guide,
+        "level_style": level_style_for(user.investment_level),
         "angle": angle or angle_for(0),
         "avoid_block": format_avoid_block(avoid or []),
         # 주제명만 주면 범위가 모호해 다른 개념으로 샌다(실측). 카탈로그 설명을 함께 준다.
         "topic_hint": f" ({topic_desc})" if topic_desc else "",
+        "direction_block": format_direction_block(direction),
     }
 
     for attempt in range(3):  # 최대 3번 재시도
@@ -176,7 +264,7 @@ async def generate_ox_question(
 
 async def generate_mc_question(
     user: UserContext, topic: str, angle: str = "", avoid: list[str] | None = None,
-    topic_desc: str = "", answer_pos: int | None = None,
+    topic_desc: str = "", answer_pos: int | None = None, direction: str = "",
 ) -> dict:
     level_guide = LEVEL_GUIDE.get(user.investment_level, LEVEL_GUIDE["미설정"])
     chain = MC_PROMPT | _get_llm()
@@ -186,10 +274,12 @@ async def generate_mc_question(
         "topic": topic,
         "level": user.investment_level,
         "level_guide": level_guide,
+        "level_style": level_style_for(user.investment_level),
         "angle": angle or angle_for(0),
         "avoid_block": format_avoid_block(avoid or []),
         # 주제명만 주면 범위가 모호해 다른 개념으로 샌다(실측). 카탈로그 설명을 함께 준다.
         "topic_hint": f" ({topic_desc})" if topic_desc else "",
+        "direction_block": format_direction_block(direction),
         "answer_pos": answer_pos,
     }
 
@@ -227,22 +317,31 @@ async def generate_mc_question(
 async def generate_quiz(
     user: UserContext, quiz_type: str, topic: str = None,
     angle: str = "", avoid: list[str] | None = None, topic_desc: str = "",
-    answer_pos: int | None = None,
+    answer_pos: int | None = None, direction: str = "",
 ) -> dict:
     """문제 1개 생성.
 
     angle/avoid는 같은 주제로 여러 문제를 만들 때 중복을 막기 위한 것이다.
     (angle = 이번 문제의 출제 방향, avoid = 이미 만든 문제 목록)
     생략하면 첫 번째 관점을 쓴다 - 단건 생성에서는 중복 걱정이 없다.
+
+    topic_desc/direction 을 주지 않으면 카탈로그에서 주제명으로 찾아 채운다.
+    (topic_desc = 주제 범위를 좁히는 설명, direction = 카테고리의 출제 방향)
     """
     if not topic:
         topic = _get_random_topic(quiz_type)
 
+    # 호출자가 명시하지 않았으면 카탈로그에서 문맥을 찾는다 (LLM 호출 없는 이름 매칭).
+    # 못 찾으면 빈 문자열이라 기존 동작 그대로다.
+    if not topic_desc and not direction:
+        topic_desc, direction = find_topic_context(topic, user.investment_level)
+
     if quiz_type == "OX":
-        return await generate_ox_question(user, topic, angle, avoid, topic_desc)
+        return await generate_ox_question(
+            user, topic, angle, avoid, topic_desc, direction)
     elif quiz_type == "MULTIPLE_CHOICE":
         return await generate_mc_question(
-            user, topic, angle, avoid, topic_desc, answer_pos)
+            user, topic, angle, avoid, topic_desc, answer_pos, direction)
     else:
         raise ValueError(f"지원하지 않는 문제 유형: {quiz_type}")
 
@@ -262,6 +361,11 @@ async def generate_quiz_batch(
     if not topic:
         topic = _get_random_topic(quiz_type)
 
+    # 주제명으로 카탈로그를 찾아 설명·출제 방향을 채운다 (못 찾으면 빈 문자열).
+    # 세트 전체가 같은 주제이므로 한 번만 찾으면 된다.
+    catalog_desc, direction = find_topic_context(topic, user.investment_level)
+    topic_desc = topic_desc or catalog_desc
+
     questions: list[dict] = []
     seen_texts: list[str] = []
     gen_args: list[tuple] = []
@@ -277,7 +381,8 @@ async def generate_quiz_batch(
         # 주제마다 시작점을 밀어, 5문제 중 두 번 걸리는 자리가 주제별로 달라지게 한다.
         answer_pos = answer_pos_for(offset + i + answer_pos_offset(topic))
         question = await generate_quiz(
-            user, quiz_type, topic, angle, seen_texts, topic_desc, answer_pos)
+            user, quiz_type, topic, angle, seen_texts, topic_desc, answer_pos,
+            direction)
         # 세트 안 중복(문자·의미) + 과거 요청과의 중복
         if await _is_duplicate(question["question_text"], seen_texts, user):
             # 같은 관점으로 다시 만들면 같은 문제가 또 나온다. 관점을 밀어서 재시도한다.
@@ -287,11 +392,13 @@ async def generate_quiz_batch(
             # 피해야 하는지 모른다 (실측: 재시도가 원본과 글자까지 같은 유사도 1.000).
             retry = await generate_quiz(
                 user, quiz_type, topic, angle_for(offset + i + count),
-                seen_texts + [question["question_text"]], topic_desc, answer_pos)
+                seen_texts + [question["question_text"]], topic_desc, answer_pos,
+                direction)
             question = await _less_duplicated(question, retry, seen_texts)
         seen_texts.append(question["question_text"])
         questions.append(question)
-        gen_args.append((quiz_type, topic, angle, list(seen_texts), topic_desc, answer_pos))
+        gen_args.append(
+            (quiz_type, topic, angle, list(seen_texts), topic_desc, answer_pos, direction))
 
     await _revalidate_and_fix(questions, gen_args, user)
     # 검증·재생성이 끝난 확정본만 저장한다
@@ -349,10 +456,10 @@ async def _revalidate_and_fix(
 
     logger.warning(f"검증 불합격 {len(failed)}건 - 재생성: {list(failed.values())}")
     for idx, _reason in failed.items():
-        quiz_type, topic, angle, avoid, topic_desc, answer_pos = gen_args[idx]
+        quiz_type, topic, angle, avoid, topic_desc, answer_pos, direction = gen_args[idx]
         try:
             fixed = await generate_quiz(
-                user, quiz_type, topic, angle, avoid, topic_desc, answer_pos)
+                user, quiz_type, topic, angle, avoid, topic_desc, answer_pos, direction)
         except ValueError as e:
             logger.warning(f"{idx + 1}번 재생성 실패 - 원본 유지: {e}")
             continue
@@ -500,7 +607,11 @@ def _format_catalog(categories: list[QuizCategoryIn]) -> str:
     for cat in categories:
         level = f"({cat.investment_level}) " if cat.investment_level else ""
         desc = f" - {cat.description}" if cat.description else ""
-        lines.append(f"{level}[{cat.category_code}] {cat.category_name}{desc}")
+        # 출제 방향까지 보여준다. 소재가 겹치는 카테고리를 가르는 결정적인 단서다.
+        # (예: 중급 "보조지표 개념"과 고급 "보조지표 활용 판단"은 소재가 같고
+        #  방향만 "의미 이해" / "투자 판단에 활용"으로 다르다)
+        direction = f" [출제 방향: {cat.problem_direction}]" if cat.problem_direction else ""
+        lines.append(f"{level}[{cat.category_code}] {cat.category_name}{desc}{direction}")
         for d in cat.details:
             d_desc = f": {d.description}" if d.description else ""
             lines.append(f"  - {d.detail_code} ({d.detail_name}){d_desc}")
@@ -712,22 +823,30 @@ async def generate_quiz_from_prompt(prompt: str, user: UserContext) -> list[dict
         # 주제별로 돌리면 주제가 전부 다를 때 모두 0번째라 정답이 1번에 몰린다.
         answer_pos = answer_pos_for(set_index)
 
+        # 1단계 분석이 정해준 카테고리에서 주제 설명과 출제 방향을 꺼내 생성에 넘긴다.
+        # 이걸 넘기지 않으면 카테고리는 저장용 라벨로만 쓰이고, 정작 문제 내용에는
+        # 카테고리가 의도한 출제 방향이 반영되지 않는다.
+        primary_detail = item["detail_codes"][0] if item["detail_codes"] else None
+        topic_desc = get_detail_description(item["category_code"], primary_detail)
+        direction = get_problem_direction(item["category_code"])
+
         question = await generate_quiz(
-            user, item["question_type"], topic, angle, seen_texts,
-            answer_pos=answer_pos)
+            user, item["question_type"], topic, angle, seen_texts, topic_desc,
+            answer_pos, direction)
         # 세트 안 중복(문자 유사도) + 과거 요청과의 중복(임베딩 유사도)
         if await _is_duplicate(question["question_text"], seen_texts, user):
             question = await generate_quiz(
-                user, item["question_type"], topic, angle, seen_texts,
-                answer_pos=answer_pos)
+                user, item["question_type"], topic, angle, seen_texts, topic_desc,
+                answer_pos, direction)
         seen_texts.append(question["question_text"])
 
         question["category_code"] = item["category_code"]
         question["detail_codes"] = item["detail_codes"]
-        question["primary_detail_code"] = item["detail_codes"][0] if item["detail_codes"] else None
+        question["primary_detail_code"] = primary_detail
         questions.append(question)
         gen_args.append(
-            (item["question_type"], topic, angle, list(seen_texts), "", answer_pos))
+            (item["question_type"], topic, angle, list(seen_texts), topic_desc,
+             answer_pos, direction))
 
     await _revalidate_and_fix(questions, gen_args, user)
     await bank.register(questions, user.user_id)
