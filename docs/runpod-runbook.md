@@ -617,6 +617,69 @@ KIS_ACCOUNT         {{ RUNPOD_SECRET_KIS_ACCOUNT }}
 - 생성 지연이 count=1 에 평균 52초다. 문제 은행 사전 생성(남은 과제 3번)이
   가장 효과적인 개선이다.
 
+### `/chat/stream` SSE 검증 — 2026-08-30 통과
+
+NestJS 가 실제로 붙는 주 엔드포인트다. Cloudflare 프록시가 SSE 를 버퍼링하면
+토큰이 실시간으로 안 흘러 스트리밍이 무의미해지므로 별도로 확인했다.
+
+```
+status 200 | content-type: text/event-stream; charset=utf-8
+Transfer-Encoding: chunked | CF-RAY: ...-ICN   (인천 엣지)
+meta 2,019ms  →  첫 token 3,245ms  →  done 14,841ms
+923줄이 12.8초에 걸쳐 분산 도착 — 버퍼링 없음
+token 이벤트 984개 중 643개에 내용, 조립 시 1,234자
+```
+
+**버퍼링 없음. 그대로 써도 된다.** 빈 `content` 가 섞이는 것은 LangChain
+스트리밍의 정상 동작이므로 클라이언트는 빈 문자열을 그냥 무시하면 된다.
+
+계측 시 주의: PowerShell 5.1 은 **BOM 없는 UTF-8 스크립트를 CP949 로 읽는다.**
+한글 질문이 깨진 채 전송되어 모델이 엉뚱하게 답하는 것을 앱 버그로 오인했다.
+테스트 스크립트는 BOM 을 넣어 저장할 것.
+
+## 8-3. NestJS 백엔드 연동
+
+```env
+AI_BASE_URL=https://<POD_ID>-8080.proxy.runpod.net
+AI_API_KEY=<.env 의 AI_API_KEY 와 동일한 값>
+```
+
+`<POD_ID>` 는 **파드를 만들 때마다 바뀐다. 하드코딩 금지.**
+
+```ts
+HttpModule.register({
+  baseURL: process.env.AI_BASE_URL,
+  headers: { 'X-API-Key': process.env.AI_API_KEY },
+  timeout: 180_000,
+})
+```
+
+### 타임아웃이 이 연동의 최대 함정
+
+| 요청 | 실측 |
+|---|---|
+| `/quiz/generate` count=1 | 평균 52초, 최대 **73초** |
+| `/quiz/generate` count=4 | **98.9초** |
+| `/chat/evaluate` (RAG) | 35.7초 |
+| `/chat/stream` 완료까지 | 14.8초 |
+| 동시 20명 | p95 41.5초 |
+
+axios 기본값은 무제한이지만 `HttpModule` 에 timeout 을 걸었거나 앞단에 nginx 가
+있으면 **기본 60초**에서 잘린다. 서버는 답을 만들고 있는데 백엔드가 먼저 끊는다.
+**180초 이상**으로 잡을 것.
+
+### 그 밖에
+
+- **500 을 자동 재시도하지 말 것.** `/quiz/generate` 의 500 은 이미 LLM 을 3번
+  호출하고 실패한 결과다. 자동 재시도하면 GPU 를 80초 더 태우고, 동시 사용자가
+  몰릴 때 눈덩이가 된다. 사용자에게 "다시 시도" 버튼을 주는 쪽이 맞다.
+- **인증 예외 경로**: `/health`, `/docs`, `/redoc`, `/openapi.json` 은 키 없이 열린다
+  (의도된 설계). 그 외는 401.
+- **readiness**: entrypoint 가 vLLM health 를 기다린 뒤 FastAPI 를 띄우므로,
+  `/health` 가 200 이면 전체 스택이 준비된 상태다.
+- **계약서**: `docs/openapi.json`. 갱신은 `uv run python scripts/export_openapi.py`.
+  이번 서버화 작업으로 API 표면은 바뀌지 않았다.
+
 ### 자격증명 위치
 
 **모든 키는 `.env` 에 있다** (`.gitignore` 4번째 줄로 제외됨, 추적 안 됨).
