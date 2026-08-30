@@ -14,6 +14,14 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = "no-key"
     # openai 백엔드에서 thinking 비활성화 (Qwen3.5/3.6 채팅 템플릿 인자)
     LLM_DISABLE_THINKING: bool = True
+    # 모델 비교 실험용 오버라이드. 기본값은 기존 동작을 그대로 둔다.
+    #   LLM_REASONING_EFFORT : Qwen3.8 계열의 추론 강도 (low | medium | xhigh).
+    #                          빈 문자열이면 보내지 않는다.
+    #   LLM_MAX_TOKENS       : >0 이면 build_llm 의 num_predict 를 덮어쓴다.
+    #                          추론을 켜면 사고 토큰이 응답 예산을 먹어 본문이
+    #                          잘리므로, 비교 실행에서는 넉넉히 올려야 공정하다.
+    LLM_REASONING_EFFORT: str = ""
+    LLM_MAX_TOKENS: int = 0
     # 이 AI 서버 자체의 인증 키 (외부 노출 시 필수)
     # 비워두면 인증을 끈다 - 로컬 개발용. 포트포워딩할 때는 반드시 채울 것.
     AI_API_KEY: str = ""

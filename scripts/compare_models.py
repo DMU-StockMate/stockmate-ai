@@ -28,6 +28,7 @@
 import argparse
 import asyncio
 import json
+import re
 import sys
 import time
 from datetime import datetime
@@ -46,13 +47,24 @@ from app.core.config import settings  # noqa: E402
 
 # 비교 공정성 - 상태를 남기는 기능을 끈다
 settings.QUIZ_BANK_ENABLED = False
-settings.DATASET_COLLECT_ENABLED = False
+# 학습데이터 수집 필드는 archive/finetune-9b 브랜치에만 있다.
+# develop 에는 없으므로 존재할 때만 끈다.
+if hasattr(settings, "DATASET_COLLECT_ENABLED"):
+    settings.DATASET_COLLECT_ENABLED = False
 
 from app.core.llm import build_llm            # noqa: E402
 from app.schemas.chat import UserContext      # noqa: E402
 from app.services.quiz import quality         # noqa: E402
 
 USER = UserContext(user_id=1, investment_level="초급")
+
+# 추론 모드를 켜면 llama-server(--jinja)가 사고 과정을 본문에 섞어 보내기도 한다.
+# 그대로 채점하면 assert_korean 이 영어 혼입으로 오탐하고 키워드 판정도 흐려진다.
+_THINK = re.compile(r"<think>.*?</think>", re.S)
+
+
+def strip_think(text: str) -> str:
+    return _THINK.sub("", text).strip()
 
 # =========================================================
 # 1. 한국어 금융 용어 정확도 (자동 채점)
@@ -148,7 +160,7 @@ async def run_terms() -> list:
         t0 = time.perf_counter()
         try:
             resp = await llm.ainvoke(case["q"])
-            text = getattr(resp, "content", str(resp))
+            text = strip_think(getattr(resp, "content", str(resp)))
             err = None
         except Exception as e:
             text, err = "", f"{type(e).__name__}: {e}"

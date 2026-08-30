@@ -18,6 +18,12 @@ import traceback
 
 sys.path.insert(0, ".")
 
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from app.schemas.chat import UserContext
 from app.services.quiz.categories import (
     QUIZ_CATEGORY_CATALOG, get_detail_description, get_problem_direction,

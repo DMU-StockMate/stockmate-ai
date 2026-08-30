@@ -27,13 +27,17 @@ def build_llm(temperature: float, num_predict: int = 1024, num_ctx: int = 6144):
             # Qwen3.5/3.6 채팅 템플릿이 enable_thinking 을 받는다.
             # RAG/퀴즈는 속도가 중요해 추론 모드를 끈다.
             extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        if settings.LLM_REASONING_EFFORT:
+            # Qwen3.8 계열은 enable_thinking 이 아니라 reasoning_effort 를 받는다.
+            # 기본값이 xhigh 라 지정하지 않으면 과하게 오래 생각한다.
+            extra_body["reasoning_effort"] = settings.LLM_REASONING_EFFORT
 
         return ChatOpenAI(
             base_url=settings.LLM_BASE_URL,
             api_key=settings.LLM_API_KEY,
             model=settings.LLM_MODEL,
             temperature=temperature,
-            max_tokens=num_predict,
+            max_tokens=(settings.LLM_MAX_TOKENS or num_predict),
             extra_body=extra_body or None,
         )
 
