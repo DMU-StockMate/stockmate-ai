@@ -5,6 +5,7 @@ from collections import defaultdict
 from langchain_core.prompts import ChatPromptTemplate
 from app.schemas.chat import UserContext
 from app.schemas.quiz import QuizCategoryIn
+from app.core.config import settings
 from app.core.logger import setup_logger
 from app.services.quiz import bank
 from app.services.quiz.categories import (
@@ -480,9 +481,19 @@ async def _revalidate_and_fix(
 # 프롬프트 기반 문제 생성
 # =========================================================
 
-# 순차 생성이라 개수에 비례해 응답이 느려지므로 상한을 둔다 (팀 결정: 10개).
+# 생성은 병렬이 됐지만 개수가 늘면 여전히 느려진다. 동시 실행 상한
+# (QUIZ_GEN_CONCURRENCY=5)을 넘는 개수는 여러 파도로 나뉘고, 파도 하나가
+# 라운드 하나이기 때문이다. count=10 이면 분석 1 + 생성 2파도 + 검증 1 = 4라운드.
+#
+# ⚠️ 파드 실측 기준 라운드당 약 22초라 count=10 은 약 88초다. RunPod 프록시가
+# 100초에서 524 로 끊으므로 상한 요청은 위험 구간에 있다. 백엔드에서 사용자가
+# 고를 수 있는 개수를 5 이하로 제한하는 것을 권장한다.
 MAX_PROMPT_QUIZ_COUNT = 10
-DEFAULT_PROMPT_QUIZ_COUNT = 5
+
+# 프롬프트에 개수 언급이 없을 때의 기본값. settings 에서 읽는다
+# (발표 당일 재빌드 없이 템플릿 env 로 조절할 수 있어야 하므로).
+def _default_prompt_quiz_count() -> int:
+    return max(1, min(settings.PROMPT_QUIZ_DEFAULT_COUNT, MAX_PROMPT_QUIZ_COUNT))
 
 # 1단계(분석) 프롬프트: 사용자 프롬프트에서 주제/개수/유형을 파악하고
 # NestJS가 전달한 카테고리/상세 코드 목록에 매핑한 '출제 계획'을 JSON으로 만든다.
@@ -677,7 +688,7 @@ async def _analyze_once(prompt: str, categories: list[QuizCategoryIn]) -> list[d
             response = await chain.ainvoke({
                 "prompt": prompt,
                 "catalog": catalog,
-                "default_count": DEFAULT_PROMPT_QUIZ_COUNT,
+                "default_count": _default_prompt_quiz_count(),
             })
             data = _extract_json(response.content)
             break

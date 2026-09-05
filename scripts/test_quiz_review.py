@@ -133,6 +133,8 @@ def _install_stubs():
         QUIZ_GEN_CONCURRENCY = 5
         # 과거 문제와의 대조. 운영 기본값과 같게 꺼둔다.
         QUIZ_DUP_CHECK_PAST = False
+        # 프롬프트 경로의 기본 문제 수 (운영 기본값과 동일).
+        PROMPT_QUIZ_DEFAULT_COUNT = 3
 
 
     # Qdrant / 임베딩 스텁 - 퀴즈 뱅크가 실제 서버를 찾지 않게 한다

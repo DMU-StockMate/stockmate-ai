@@ -84,6 +84,7 @@ ENV HF_HOME=/workspace/hf \
     \
     QUIZ_GEN_CONCURRENCY=5 \
     QUIZ_DUP_CHECK_PAST=false \
+    PROMPT_QUIZ_DEFAULT_COUNT=3 \
     \
     QDRANT_HOST=127.0.0.1 \
     QDRANT_PORT=6333 \
