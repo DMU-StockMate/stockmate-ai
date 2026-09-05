@@ -80,6 +80,7 @@ ENV HF_HOME=/workspace/hf \
     LLM_MODEL=qwen3.8-27b \
     LLM_DISABLE_THINKING=False \
     LLM_REASONING_EFFORT=medium \
+    CHAT_REASONING_EFFORT=none \
     LLM_MAX_TOKENS=4096 \
     \
     QUIZ_GEN_CONCURRENCY=5 \

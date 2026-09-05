@@ -114,7 +114,12 @@ def _get_llm():
     문장 중간에 잘리는 일이 생겼다 (실측: 삼성전자/SK하이닉스 질문 모두 잘림).
     llama-server 는 -c 16384 로 떠 있어 3072 여유는 충분하다.
     """
-    return build_llm(temperature=0.3, num_predict=3072, num_ctx=6144)
+    return build_llm(
+        temperature=0.3, num_predict=3072, num_ctx=6144,
+        # 채팅은 퀴즈와 다른 사고 강도를 쓴다 (config.CHAT_REASONING_EFFORT).
+        # 빈 문자열이면 전역값으로 되돌아간다.
+        reasoning_effort=settings.CHAT_REASONING_EFFORT or None,
+    )
 
 
 def _convert_history(history: list[Message]) -> list:

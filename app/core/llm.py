@@ -13,7 +13,8 @@ llama-server 띄우는 예:
 from app.core.config import settings
 
 
-def build_llm(temperature: float, num_predict: int = 1024, num_ctx: int = 6144):
+def build_llm(temperature: float, num_predict: int = 1024, num_ctx: int = 6144,
+              reasoning_effort: str | None = None):
     """설정된 백엔드에 맞는 LangChain 채팅 모델을 만든다.
 
     num_ctx 는 Ollama 전용이다. llama-server 는 서버 기동 시 -c 로 정하므로
@@ -38,7 +39,11 @@ def build_llm(temperature: float, num_predict: int = 1024, num_ctx: int = 6144):
         #   "max"|"xhigh"|"high"|"medium"|"low"|"minimal"|"none"
         # 로 죽는데, 이 400 은 생성 재시도 3회를 전부 태우고 500 으로 나간다.
         # 보이지 않는 공백 한 칸 때문에 원인 파악이 어려운 실패라 여기서 막는다.
-        effort = settings.LLM_REASONING_EFFORT.strip()
+        # 호출부가 명시하면 그것을, 아니면 전역 설정을 쓴다.
+        # 퀴즈와 채팅이 서로 다른 강도를 쓰기 위한 통로다 (config.py 참고).
+        effort = (reasoning_effort
+                  if reasoning_effort is not None
+                  else settings.LLM_REASONING_EFFORT).strip()
         if effort:
             extra_body["reasoning_effort"] = effort
 
