@@ -82,6 +82,9 @@ ENV HF_HOME=/workspace/hf \
     LLM_REASONING_EFFORT=medium \
     LLM_MAX_TOKENS=4096 \
     \
+    QUIZ_GEN_CONCURRENCY=5 \
+    QUIZ_DUP_CHECK_PAST=false \
+    \
     QDRANT_HOST=127.0.0.1 \
     QDRANT_PORT=6333 \
     EMBEDDING_DEVICE=cuda \

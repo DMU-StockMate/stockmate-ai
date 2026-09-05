@@ -151,6 +151,10 @@ def _install_stubs():
         QUIZ_BANK_COLLECTION = "quiz_bank_test"
         QUIZ_BANK_ENABLED = True
         QUIZ_DUP_THRESHOLD = 0.90
+        # 문제 생성이 순차 -> 병렬로 바뀌며 추가된 설정 (concurrency.py).
+        QUIZ_GEN_CONCURRENCY = 5
+        # 과거 문제와의 대조. 운영 기본값과 같게 꺼둔다.
+        QUIZ_DUP_CHECK_PAST = False
 
 
     # Qdrant / 임베딩 스텁 - 퀴즈 뱅크가 실제 서버를 찾지 않게 한다
@@ -180,6 +184,7 @@ def _install_stubs():
 
 _install_stubs()
 
+from app.core.config import settings as SETTINGS   # noqa: E402  (스텁 _Settings 인스턴스)
 from app.schemas.chat import UserContext            # noqa: E402
 from app.services.quiz import generator as G        # noqa: E402
 from app.services.quiz import quality as Q          # noqa: E402
@@ -428,8 +433,12 @@ def test_angle_rotation():
     check("관점 순서가 정의 순서대로", angles == Q.GENERATION_ANGLES[:4])
 
     avoids = [c["avoid_block"] for c in gen_calls()]
-    check("첫 호출 avoid 비어있음", avoids[0] == "(아직 없음)", avoids[0])
-    check("avoid 누적", avoids[3].count("- ") == 3, avoids[3].count("- "))
+    # 생성이 순차 -> 병렬로 바뀌면서 avoid 계약이 달라졌다.
+    # 동시에 만들면 서로를 볼 수 없으므로 1단계에는 avoid 힌트가 없다.
+    # 순차 생성이 주던 힌트는 실제로 겹친 문제에 한해 2단계에서 복원된다
+    # (test_parallel_dedupe 참고).
+    check("1단계는 avoid 없이 동시 생성",
+          all(a == "(아직 없음)" for a in avoids), avoids)
 
     # 프롬프트 기반: 주제별로 독립 순환
     plan = {"relevant": True, "count": 5, "items": [
@@ -611,15 +620,20 @@ def test_bank_integration():
     print("\n--- 퀴즈 뱅크 연동 ---")
     global BANK_SIMILARITY
 
-    # 과거 문제와 유사 -> 재생성 유발
+    # 과거 문제와 유사 -> 재생성 유발.
+    # 이 경로는 QUIZ_DUP_CHECK_PAST 로 제어되고 운영 기본값이 꺼짐이라
+    # (이번 요청 안에서의 중복만 막는 정책) 여기서만 켠다.
+    # 끄고 켤 때의 동작 자체는 test_dup_scope 가 따로 본다.
     reset()
     BANK_SIMILARITY = 0.95
     BANK_UPSERTS.clear()
+    SETTINGS.QUIZ_DUP_CHECK_PAST = True
     try:
         asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2))
         check("과거 중복 감지 시 재생성", len(gen_calls()) == 4, len(gen_calls()))
     finally:
         BANK_SIMILARITY = None
+        SETTINGS.QUIZ_DUP_CHECK_PAST = False
 
     # 중복 없으면 재생성 없음
     reset()
@@ -764,6 +778,89 @@ def test_answer_position():
     check("지시 위반 시 재생성", pos2 == wanted, f"{pos2} (요구 {wanted})")
 
 
+# =========================================================
+# 14. 병렬 생성 후 중복 해소
+# =========================================================
+
+def test_parallel_dedupe():
+    """동시 생성이라 1단계에는 avoid 가 없다. 겹친 것만 2단계에서 되갚는지 본다.
+
+    중복은 과거 문제 대조(BANK_SIMILARITY)로 유도한다. 그 경로는 기본이 꺼져
+    있으므로(QUIZ_DUP_CHECK_PAST=False) 이 테스트에서만 켠다.
+    """
+    print("\n--- 병렬 생성 후 중복 해소 ---")
+    global BANK_SIMILARITY
+
+    reset()
+    BANK_SIMILARITY = 0.99  # 과거 문제와 전부 중복 판정시킨다
+    SETTINGS.QUIZ_DUP_CHECK_PAST = True
+    try:
+        asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=3))
+    finally:
+        BANK_SIMILARITY = None
+        SETTINGS.QUIZ_DUP_CHECK_PAST = False
+
+    calls = gen_calls()
+    check("중복분이 재생성됨", len(calls) > 3, f"{len(calls)}회 (1단계 3 + 재생성)")
+
+    first_pass, retries = calls[:3], calls[3:]
+    check("1단계는 avoid 없음",
+          all(c["avoid_block"] == "(아직 없음)" for c in first_pass),
+          [c["avoid_block"] for c in first_pass])
+    # 거부된 자기 자신을 avoid 에 넣지 않으면 모델이 방금 만든 것을 그대로
+    # 다시 내놓는다 (실측 유사도 1.000). 재생성 호출에는 반드시 채워져야 한다.
+    check("재생성에는 avoid 가 채워짐",
+          bool(retries) and all(c["avoid_block"] != "(아직 없음)" for c in retries),
+          [c["avoid_block"] for c in retries])
+    # 같은 관점으로 다시 만들면 같은 문제가 또 나온다(실측 유사도 0.979) - 관점을 민다.
+    # 세트 전체와 겹치지 않게 할 수는 없다: 관점은 5주기라 count 만큼 밀면 결국 순환한다.
+    # 요구되는 것은 "그 문제가 방금 쓴 관점"을 다시 쓰지 않는 것이다.
+    check("재생성은 자기 1단계와 다른 관점",
+          all(r["angle"] != f["angle"] for r, f in zip(retries, first_pass)),
+          [(f["angle"][:12], r["angle"][:12]) for f, r in zip(first_pass, retries)])
+
+    # 중복이 없으면 재생성이 한 번도 일어나지 않아야 한다 (불필요한 LLM 호출 금지)
+    reset()
+    asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=3))
+    check("중복 없으면 재생성 없음", len(gen_calls()) == 3, len(gen_calls()))
+
+
+# =========================================================
+# 15. 중복 검사 범위 (QUIZ_DUP_CHECK_PAST)
+# =========================================================
+
+def test_dup_scope():
+    """과거 문제 대조는 설정으로 끈다. 세트 내 중복 검사는 끄지 않는다."""
+    print("\n--- 중복 검사 범위 ---")
+    global BANK_SIMILARITY
+
+    # 과거 문제와 전부 겹치는 상황을 만들어 둔다.
+    # 꺼져 있으면 이 신호를 아예 보지 않아야 한다.
+    BANK_SIMILARITY = 0.99
+    try:
+        reset()
+        SETTINGS.QUIZ_DUP_CHECK_PAST = False
+        asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=3))
+        off_calls = len(gen_calls())
+        check("꺼짐: 과거와 겹쳐도 재생성 없음", off_calls == 3, f"{off_calls}회")
+
+        reset()
+        SETTINGS.QUIZ_DUP_CHECK_PAST = True
+        asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=3))
+        on_calls = len(gen_calls())
+        check("켜짐: 과거와 겹치면 재생성", on_calls > 3, f"{on_calls}회")
+    finally:
+        BANK_SIMILARITY = None
+        SETTINGS.QUIZ_DUP_CHECK_PAST = False
+
+    # 세트 내 중복은 설정과 무관하게 항상 막아야 한다.
+    # 같은 문장을 3번 내놓게 하면 문자 유사도 단계에서 걸린다.
+    same = "PER이 낮다는 것에 대한 설명으로 옳은 것은 무엇인가"
+    reset([_mc(same), _mc(same), _mc(same)])
+    asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=3))
+    texts = [q for q in gen_calls()]
+    check("꺼져 있어도 세트 내 중복은 재생성", len(texts) > 3, f"{len(texts)}회")
+
 
 if __name__ == "__main__":
     test_prompts_carry_quality_rules()
@@ -779,6 +876,8 @@ if __name__ == "__main__":
     test_bank_integration()
     test_shared_module()
     test_answer_position()
+    test_parallel_dedupe()
+    test_dup_scope()
 
     print("\n" + "=" * 55)
     if FAILURES:

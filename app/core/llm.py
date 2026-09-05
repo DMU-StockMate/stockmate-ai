@@ -27,10 +27,20 @@ def build_llm(temperature: float, num_predict: int = 1024, num_ctx: int = 6144):
             # Qwen3.5/3.6 채팅 템플릿이 enable_thinking 을 받는다.
             # RAG/퀴즈는 속도가 중요해 추론 모드를 끈다.
             extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-        if settings.LLM_REASONING_EFFORT:
-            # Qwen3.8 계열은 enable_thinking 이 아니라 reasoning_effort 를 받는다.
-            # 기본값이 xhigh 라 지정하지 않으면 과하게 오래 생각한다.
-            extra_body["reasoning_effort"] = settings.LLM_REASONING_EFFORT
+        # Qwen3.8 계열은 enable_thinking 이 아니라 reasoning_effort 를 받는다.
+        # 기본값이 xhigh 라 지정하지 않으면 과하게 오래 생각한다.
+        #
+        # strip() 이 붙은 이유: 이 값은 런북 절차상 사람이 셸에서 손으로 넣는다
+        # (§6 의 $env:LLM_REASONING_EFFORT=... , cmd 의 set ...). cmd 의
+        #   set LLM_REASONING_EFFORT=low && ...
+        # 은 값에 **후행 공백을 포함시킨다.** 그러면 "low " 가 서버로 나가
+        #   400 reasoning_effort: Invalid option: expected one of
+        #   "max"|"xhigh"|"high"|"medium"|"low"|"minimal"|"none"
+        # 로 죽는데, 이 400 은 생성 재시도 3회를 전부 태우고 500 으로 나간다.
+        # 보이지 않는 공백 한 칸 때문에 원인 파악이 어려운 실패라 여기서 막는다.
+        effort = settings.LLM_REASONING_EFFORT.strip()
+        if effort:
+            extra_body["reasoning_effort"] = effort
 
         return ChatOpenAI(
             base_url=settings.LLM_BASE_URL,

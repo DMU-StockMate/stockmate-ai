@@ -129,6 +129,10 @@ def _install_stubs():
         QUIZ_BANK_COLLECTION = "quiz_bank_test"
         QUIZ_BANK_ENABLED = True
         QUIZ_DUP_THRESHOLD = 0.90
+        # 문제 생성이 순차 -> 병렬로 바뀌며 추가된 설정 (concurrency.py).
+        QUIZ_GEN_CONCURRENCY = 5
+        # 과거 문제와의 대조. 운영 기본값과 같게 꺼둔다.
+        QUIZ_DUP_CHECK_PAST = False
 
 
     # Qdrant / 임베딩 스텁 - 퀴즈 뱅크가 실제 서버를 찾지 않게 한다
@@ -309,7 +313,7 @@ def test_dedup():
 def test_pipeline():
     print("\n--- 파이프라인 ---")
 
-    # 샘플 로테이션 + avoid 누적
+    # 샘플 로테이션 + avoid 계약
     reset()
     run([wrong("원본1: EPS 상승시 PER 변화", "PER_BASIC"),
          wrong("원본2: 업종 평균과의 비교", "PER_BASIC")])
@@ -318,8 +322,11 @@ def test_pipeline():
           "원본1" in ctxs[0] and "원본2" in ctxs[1] and "원본1" in ctxs[2])
     check("한 호출에 샘플 1개만", all(c.count("문제:") == 1 for c in ctxs))
     avoids = [c["avoid_block"] for c in CALLS]
-    check("첫 호출 avoid 비어있음", avoids[0] == "(아직 없음)")
-    check("avoid 누적", avoids[4].count("- ") == 4, avoids[4].count("- "))
+    # 생성이 순차 -> 병렬로 바뀌면서 avoid 계약이 달라졌다 (concurrency.py 참고).
+    # 동시에 만들면 서로를 볼 수 없으므로 1단계에는 avoid 힌트가 없고,
+    # 실제로 겹친 문제에 한해 2단계(resolve_duplicates)에서 채워 다시 만든다.
+    check("1단계는 avoid 없이 동시 생성",
+          all(a == "(아직 없음)" for a in avoids), avoids)
 
     # 출제 관점 순환
     reset()

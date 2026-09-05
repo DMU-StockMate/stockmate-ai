@@ -1,3 +1,4 @@
+import asyncio
 import re
 from collections import defaultdict
 
@@ -10,6 +11,11 @@ from app.services.quiz.categories import (
     find_topic_context,
     get_detail_description,
     get_problem_direction,
+)
+from app.services.quiz.concurrency import (
+    generate_all,
+    regenerate_failed,
+    resolve_duplicates,
 )
 from app.services.quiz.quality import (
     ANGLE_BLOCK,
@@ -25,7 +31,6 @@ from app.services.quiz.quality import (
     extract_json,
     format_avoid_block,
     get_llm,
-    is_near_duplicate,
     validate_questions,
 )
 
@@ -376,13 +381,19 @@ async def generate_quiz_batch(
     user: UserContext, quiz_type: str, topic: str = None, count: int = 1,
     topic_desc: str = "",
 ) -> list[dict]:
-    """같은 topic으로 count개의 문제를 순차 생성한다.
+    """같은 topic으로 count개의 문제를 **동시에** 생성한다.
 
-    로컬 Ollama가 단일 모델 인스턴스라 동시 요청을 병렬로 못 받는 경우가 많아
-    순차 생성으로 처리한다 (팀 논의 결과 - 속도보단 안정성 우선).
-    같은 topic으로 여러 번 생성하면 LLM이 같은 문제를 반복할 수 있어서,
-    문제 텍스트가 이전에 나온 것과 겹치면 한 번 더 재생성을 시도한다
-    (그래도 겹치면 마지막 결과를 그대로 채택 - count는 항상 맞춰야 하므로).
+    예전에는 순차 생성이었다. 근거는 "로컬 Ollama 가 단일 모델 인스턴스라 동시
+    요청을 병렬로 못 받는다" 였는데, 서빙이 vLLM(연속 배칭)으로 바뀌면서 무효가
+    됐다 - 리허설 실측으로 동시 20건이 p50=p95=15.0초에 전부 성공했고 KV 캐시
+    여유가 49배였다. 순차 생성은 응답 시간만 개수에 비례해 늘리고 있었다.
+
+    출제 관점(angle)과 정답 위치(answer_pos)는 인덱스만으로 정해지므로 앞
+    문제의 결과를 기다릴 이유가 애초에 없었다. 순차 생성이 주던 유일한 이점은
+    "이미 만든 문제를 피하라"는 avoid 힌트인데, 그건 세트가 나온 뒤 실제로
+    겹친 것만 골라 되갚는다(concurrency.resolve_duplicates).
+
+    자세한 배경은 concurrency.py 모듈 독스트링 참고.
     """
     if not topic:
         topic = _get_random_topic(quiz_type)
@@ -392,39 +403,47 @@ async def generate_quiz_batch(
     catalog_desc, direction = find_topic_context(topic, user.investment_level)
     topic_desc = topic_desc or catalog_desc
 
-    questions: list[dict] = []
-    seen_texts: list[str] = []
-    gen_args: list[tuple] = []
-
     # 과거에 이 주제로 만든 문제 수만큼 관점을 밀어, 재요청 시 다른 관점부터 시작한다
     offset = await bank.angle_offset(topic, user.user_id)
 
-    for i in range(count):
-        # 같은 topic이 반복되므로 문제마다 출제 관점을 돌려 중복을 막는다.
-        # 이미 만든 문제도 프롬프트에 넘겨 같은 내용을 피하게 한다.
-        angle = angle_for(offset + i)
-        # 관점은 5주기, 정답 위치는 4주기라 서로소다. 20문제가 지나야 조합이 반복된다.
-        # 주제마다 시작점을 밀어, 5문제 중 두 번 걸리는 자리가 주제별로 달라지게 한다.
-        answer_pos = answer_pos_for(offset + i + answer_pos_offset(topic))
-        question = await generate_quiz(
-            user, quiz_type, topic, angle, seen_texts, topic_desc, answer_pos,
-            direction)
-        # 세트 안 중복(문자·의미) + 과거 요청과의 중복
-        if await _is_duplicate(question["question_text"], seen_texts, user):
-            # 같은 관점으로 다시 만들면 같은 문제가 또 나온다. 관점을 밀어서 재시도한다.
-            # (실측: ROE 5문제에서 서로 다른 관점인데도 1번과 2번이 유사도 0.979 였다.
-            #  관점 회전만으로는 부족하므로, 최소한 재시도는 다른 관점으로 간다)
-            # 거부된 문제를 avoid 에 넣어야 한다. 안 넣으면 모델이 방금 만든 것을
-            # 피해야 하는지 모른다 (실측: 재시도가 원본과 글자까지 같은 유사도 1.000).
-            retry = await generate_quiz(
-                user, quiz_type, topic, angle_for(offset + i + count),
-                seen_texts + [question["question_text"]], topic_desc, answer_pos,
-                direction)
-            question = await _less_duplicated(question, retry, seen_texts)
-        seen_texts.append(question["question_text"])
-        questions.append(question)
-        gen_args.append(
-            (quiz_type, topic, angle, list(seen_texts), topic_desc, answer_pos, direction))
+    # 문제마다 관점과 정답 위치를 미리 확정한다. 둘 다 인덱스의 함수라
+    # 생성 순서와 무관하다 - 이것이 병렬화가 성립하는 근거다.
+    # 관점은 5주기, 정답 위치는 4주기라 서로소다. 20문제가 지나야 조합이 반복된다.
+    # 주제마다 시작점을 밀어, 5문제 중 두 번 걸리는 자리가 주제별로 달라지게 한다.
+    plan = [
+        (angle_for(offset + i), answer_pos_for(offset + i + answer_pos_offset(topic)))
+        for i in range(count)
+    ]
+
+    def make(i: int, avoid: list[str], angle: str = ""):
+        _angle, answer_pos = plan[i]
+
+        async def _make() -> dict:
+            return await generate_quiz(
+                user, quiz_type, topic, angle or _angle, avoid, topic_desc,
+                answer_pos, direction)
+
+        return _make
+
+    questions = await generate_all([make(i, []) for i in range(count)])
+
+    # 1단계에는 avoid 힌트가 없었으므로 겹친 것만 골라 다시 만든다.
+    # 같은 관점으로 다시 만들면 같은 문제가 또 나온다(실측: ROE 5문제에서 서로 다른
+    # 관점인데도 유사도 0.979). 재시도는 세트 밖 관점으로 민다.
+    async def retry_dup(i: int, avoid: list[str]) -> dict:
+        return await make(i, avoid, angle_for(offset + i + count))()
+
+    await resolve_duplicates(questions, retry_dup, user)
+
+    # 검증 불합격 시 같은 조건으로 재생성하기 위해 생성 인자를 보관한다.
+    # avoid 는 확정된 세트 전체 - 재생성본이 나머지와 겹치지 않게 한다.
+    final_texts = [q["question_text"] for q in questions]
+    gen_args = [
+        (quiz_type, topic, plan[i][0],
+         [t for j, t in enumerate(final_texts) if j != i],
+         topic_desc, plan[i][1], direction)
+        for i in range(count)
+    ]
 
     await _revalidate_and_fix(questions, gen_args, user)
     # 검증·재생성이 끝난 확정본만 저장한다
@@ -432,47 +451,14 @@ async def generate_quiz_batch(
     return questions
 
 
-async def _less_duplicated(first: dict, retry: dict, seen_texts: list[str]) -> dict:
-    """중복으로 걸린 원본과 재시도본 중 세트와 덜 겹치는 쪽을 고른다.
-
-    재시도가 항상 나은 게 아니다. 실측(배당수익률 5문제): 0.846 으로 걸러서
-    다시 만들었더니 0.920 이 나왔다. 재시도본을 무조건 채택하면 오히려 나빠진다.
-    벡터는 캐시되어 있어 추가 임베딩 비용은 재시도본 1건뿐이다.
-    """
-    if not seen_texts:
-        return retry
-    first_score = await bank.max_similarity_in_set(first["question_text"], seen_texts)
-    retry_score = await bank.max_similarity_in_set(retry["question_text"], seen_texts)
-    if retry_score <= first_score:
-        return retry
-    logger.info(
-        f"재시도가 더 겹쳐 원본 유지 (원본 {first_score:.3f} < 재시도 {retry_score:.3f})"
-    )
-    return first
-
-
-async def _is_duplicate(text: str, seen_texts: list[str], user: UserContext) -> bool:
-    """세 단계로 본다: 세트 내 문자 유사도 -> 세트 내 의미 유사도 -> 과거 문제.
-
-    비용이 싼 순서다. 문자 유사도는 0원, 세트 내 임베딩은 CPU 1회,
-    과거 대조는 Qdrant 왕복까지 든다. 앞에서 걸리면 뒤는 건너뛴다.
-    """
-    if is_near_duplicate(text, seen_texts):
-        logger.info(f"세트 내 중복 감지(문자) - 재생성: {text[:40]}")
-        return True
-    if await bank.is_duplicate_in_set(text, seen_texts):
-        return True
-    return await bank.is_duplicate_of_past(text, user.user_id)
-
-
 async def _revalidate_and_fix(
     questions: list[dict], gen_args: list[tuple], user: UserContext,
 ) -> None:
     """정답/해설이 모순된 문제를 찾아 같은 조건으로 1회 재생성한다 (in-place 수정).
 
-    세트 전체를 LLM 1회 호출로 검사한다. 재생성본은 다시 검증하지 않는다
-    (검증 호출이 계속 늘어나는 것을 막기 위한 타협).
-    재생성에 실패하면 원본을 그대로 둔다 - 문제 개수는 항상 맞춰야 한다.
+    세트 전체를 LLM 1회 호출로 검사하고, 불합격 건은 **동시에** 다시 만든다.
+    (예전에는 불합격 건을 순차로 재생성해, 3건이 걸리면 3번을 직렬로 더 기다렸다.)
+    재생성본은 다시 검증하지 않는다 - 검증 호출이 계속 늘어나는 것을 막기 위한 타협.
     """
     failed = await validate_questions(questions)
 
@@ -481,19 +467,13 @@ async def _revalidate_and_fix(
         return
 
     logger.warning(f"검증 불합격 {len(failed)}건 - 재생성: {list(failed.values())}")
-    for idx, _reason in failed.items():
+
+    async def retry_failed(idx: int) -> dict:
         quiz_type, topic, angle, avoid, topic_desc, answer_pos, direction = gen_args[idx]
-        try:
-            fixed = await generate_quiz(
-                user, quiz_type, topic, angle, avoid, topic_desc, answer_pos, direction)
-        except ValueError as e:
-            logger.warning(f"{idx + 1}번 재생성 실패 - 원본 유지: {e}")
-            continue
-        # 카테고리 매핑 등 생성 이후 붙은 필드는 원본 것을 승계한다
-        for field in ("category_code", "detail_codes", "primary_detail_code"):
-            if field in questions[idx]:
-                fixed[field] = questions[idx][field]
-        questions[idx] = fixed
+        return await generate_quiz(
+            user, quiz_type, topic, angle, avoid, topic_desc, answer_pos, direction)
+
+    await regenerate_failed(questions, failed, retry_failed)
 
 
 # =========================================================
@@ -831,48 +811,72 @@ async def generate_quiz_from_prompt(prompt: str, user: UserContext) -> list[dict
         f"[{', '.join(item['topic'] for item in plan)}]"
     )
 
-    questions: list[dict] = []
-    seen_texts: list[str] = []
-    gen_args: list[tuple] = []
     # 같은 주제가 여러 항목에 걸쳐 나오므로 주제별로 출제 관점을 돌린다
-    # (관점 없이 돌리면 "배당수익률 = 배당금/주가" 하나를 표현만 바꿔 반복함 - 실측)
-    topic_slot: dict[str, int] = defaultdict(int)
-    # 주제별로 과거 생성 이력만큼 관점을 밀어둔다 (재요청 시 중복 방지)
-    for t in {item["topic"] for item in plan}:
-        topic_slot[t] = await bank.angle_offset(t, user.user_id)
+    # (관점 없이 돌리면 "배당수익률 = 배당금/주가" 하나를 표현만 바꿔 반복함 - 실측).
+    # 주제별로 과거 생성 이력만큼 관점을 밀어둔다 (재요청 시 중복 방지).
+    # Qdrant 왕복이므로 주제 수만큼 동시에 조회한다.
+    unique_topics = list({item["topic"] for item in plan})
+    offsets = await asyncio.gather(
+        *(bank.angle_offset(t, user.user_id) for t in unique_topics)
+    )
+    topic_slot: dict[str, int] = defaultdict(int, dict(zip(unique_topics, offsets)))
 
+    # 생성 인자를 먼저 전부 확정한다. 관점은 주제별로, 정답 위치는 세트 전체
+    # 순번으로 돈다 (주제별로 돌리면 주제가 전부 다를 때 모두 0번째라 정답이
+    # 1번에 몰린다). 어느 쪽도 앞 문제의 결과에 의존하지 않으므로 병렬이 가능하다.
+    specs: list[dict] = []
     for set_index, item in enumerate(plan):
         topic = item["topic"]
         angle = angle_for(topic_slot[topic])
         topic_slot[topic] += 1
-        # 정답 위치는 주제별이 아니라 세트 전체 순번으로 돌린다.
-        # 주제별로 돌리면 주제가 전부 다를 때 모두 0번째라 정답이 1번에 몰린다.
-        answer_pos = answer_pos_for(set_index)
 
         # 1단계 분석이 정해준 카테고리에서 주제 설명과 출제 방향을 꺼내 생성에 넘긴다.
         # 이걸 넘기지 않으면 카테고리는 저장용 라벨로만 쓰이고, 정작 문제 내용에는
         # 카테고리가 의도한 출제 방향이 반영되지 않는다.
         primary_detail = item["detail_codes"][0] if item["detail_codes"] else None
-        topic_desc = get_detail_description(item["category_code"], primary_detail)
-        direction = get_problem_direction(item["category_code"])
+        specs.append({
+            "quiz_type": item["question_type"],
+            "topic": topic,
+            "angle": angle,
+            "topic_desc": get_detail_description(item["category_code"], primary_detail),
+            "direction": get_problem_direction(item["category_code"]),
+            "answer_pos": answer_pos_for(set_index),
+            "category_code": item["category_code"],
+            "detail_codes": item["detail_codes"],
+            "primary_detail_code": primary_detail,
+        })
 
-        question = await generate_quiz(
-            user, item["question_type"], topic, angle, seen_texts, topic_desc,
-            answer_pos, direction)
-        # 세트 안 중복(문자 유사도) + 과거 요청과의 중복(임베딩 유사도)
-        if await _is_duplicate(question["question_text"], seen_texts, user):
-            question = await generate_quiz(
-                user, item["question_type"], topic, angle, seen_texts, topic_desc,
-                answer_pos, direction)
-        seen_texts.append(question["question_text"])
+    def make(i: int, avoid: list[str], angle: str = ""):
+        spec = specs[i]
 
-        question["category_code"] = item["category_code"]
-        question["detail_codes"] = item["detail_codes"]
-        question["primary_detail_code"] = primary_detail
-        questions.append(question)
-        gen_args.append(
-            (item["question_type"], topic, angle, list(seen_texts), topic_desc,
-             answer_pos, direction))
+        async def _make() -> dict:
+            return await generate_quiz(
+                user, spec["quiz_type"], spec["topic"], angle or spec["angle"],
+                avoid, spec["topic_desc"], spec["answer_pos"], spec["direction"])
+
+        return _make
+
+    questions = await generate_all([make(i, []) for i in range(len(specs))])
+
+    # 1단계에는 avoid 힌트가 없었으므로 겹친 것만 골라 다시 만든다.
+    # 재시도는 세트 밖 관점으로 민다 - 같은 관점이면 같은 문제가 또 나온다.
+    async def retry_dup(i: int, avoid: list[str]) -> dict:
+        return await make(i, avoid, angle_for(topic_slot[specs[i]["topic"]] + i))()
+
+    await resolve_duplicates(questions, retry_dup, user)
+
+    for question, spec in zip(questions, specs):
+        question["category_code"] = spec["category_code"]
+        question["detail_codes"] = spec["detail_codes"]
+        question["primary_detail_code"] = spec["primary_detail_code"]
+
+    final_texts = [q["question_text"] for q in questions]
+    gen_args = [
+        (spec["quiz_type"], spec["topic"], spec["angle"],
+         [t for j, t in enumerate(final_texts) if j != i],
+         spec["topic_desc"], spec["answer_pos"], spec["direction"])
+        for i, spec in enumerate(specs)
+    ]
 
     await _revalidate_and_fix(questions, gen_args, user)
     await bank.register(questions, user.user_id)

@@ -11,6 +11,7 @@
   NestJS는 /quiz/generate/prompt 와 동일한 저장 로직을 재사용하면 된다.
 - 로컬 Ollama가 단일 인스턴스라 generate_quiz_batch와 같은 이유로 순차 생성한다.
 """
+import asyncio
 from collections import defaultdict
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -21,6 +22,11 @@ from app.schemas.quiz import WrongAnswerItem
 from app.services.quiz import bank
 from app.services.quiz.categories import QUIZ_CATEGORY_CATALOG
 from app.services.quiz.generator import LEVEL_GUIDE, _map_topics_to_catalog
+from app.services.quiz.concurrency import (
+    generate_all,
+    regenerate_failed,
+    resolve_duplicates,
+)
 from app.services.quiz.quality import (
     ANGLE_BLOCK,
     GENERATION_ANGLES,
@@ -35,7 +41,6 @@ from app.services.quiz.quality import (
     extract_json,
     format_avoid_block,
     get_llm,
-    is_near_duplicate,
     validate_questions,
 )
 
@@ -420,19 +425,19 @@ async def generate_quiz_from_wrong_answers(
         f"[{summary}] → 문제 {REVIEW_QUIZ_COUNT}개"
     )
 
-    questions: list[dict] = []
-    gen_args: list[tuple] = []
-    all_texts: list[str] = []
-    # 주제별 슬롯 소진 횟수 - 오답 샘플을 슬롯마다 돌려쓰기 위한 인덱스
-    slot_index: dict[str, int] = defaultdict(int)
     # 주제별로 과거 생성 이력만큼 관점을 밀어둔다.
     # 오답 이력이 그대로면 그룹·배분·샘플이 모두 같아 1차와 똑같은 세트가 나오므로
     # 관점을 옮기지 않으면 재요청이 사실상 무의미해진다.
-    for _g in groups:
-        slot_index[_g["key"]] = await bank.angle_offset(_g["topic"], user.user_id)
-    # 주제별 이미 생성된 문제 - 프롬프트 avoid 목록으로 전달
-    generated_by_topic: dict[str, list[str]] = defaultdict(list)
+    # Qdrant 왕복이므로 그룹 수만큼 동시에 조회한다.
+    keys = [g["key"] for g in groups]
+    offsets = await asyncio.gather(
+        *(bank.angle_offset(g["topic"], user.user_id) for g in groups)
+    )
+    slot_index: dict[str, int] = defaultdict(int, dict(zip(keys, offsets)))
 
+    # 생성 인자를 먼저 전부 확정한다. 슬롯마다 오답 샘플·관점·정답 위치가
+    # 인덱스만으로 정해지므로 앞 문제의 결과를 기다릴 이유가 없다.
+    specs: list[dict] = []
     for set_index, group in enumerate(slots):
         key = group["key"]
         samples = group["samples"]
@@ -444,46 +449,65 @@ async def generate_quiz_from_wrong_answers(
             wrong_context = format_wrong_context([sample])
         else:
             wrong_context = "(오답 상세 정보 없음 - 주제만 참고)"
+
         # 같은 주제의 n번째 슬롯 -> n번째 출제 관점 (결정론적 순환)
         angle = angle_for(slot_index[key])
         slot_index[key] += 1
-        # 정답 위치는 주제별이 아니라 **세트 전체 순번**으로 돌린다.
-        # 주제별로 돌리면 주제가 5개일 때 모두 0번째 슬롯이라 전부 1번이 된다.
-        answer_pos = answer_pos_for(set_index)
-
-        generate = (
-            _generate_review_ox
-            if group["question_type"] == "OX"
-            else _generate_review_mc
-        )
-        avoid = generated_by_topic[key]
-
-        question = await generate(
-            user, group["topic"], wrong_context, avoid, angle, answer_pos)
-        # 세트 안 중복(문자·의미) + 과거 요청과의 중복.
-        # 그래도 겹치면 그대로 채택한다 (문제 개수는 항상 맞춰야 하므로).
-        if await _is_duplicate(question["question_text"], all_texts, user):
-            # 같은 관점으로 다시 만들면 같은 문제가 또 나온다. 관점을 밀어 재시도한다.
-            # 거부된 문제를 avoid 에 넣어야 모델이 그것을 피한다.
-            # 안 넣으면 방금 만든 것을 그대로 다시 내놓는다 (실측 유사도 1.000).
-            retry = await generate(
-                user, group["topic"], wrong_context,
-                avoid + [question["question_text"]],
-                angle_for(slot_index[key] + REVIEW_QUIZ_COUNT), answer_pos)
-            question = await _less_duplicated(question, retry, all_texts)
-
-        all_texts.append(question["question_text"])
-        generated_by_topic[key].append(question["question_text"])
 
         mapping = categories.get(key) or {}
         detail_codes = mapping.get("detail_codes") or []
-        question["category_code"] = mapping.get("category_code")
-        question["detail_codes"] = detail_codes
-        question["primary_detail_code"] = detail_codes[0] if detail_codes else None
-        questions.append(question)
-        # 검증에서 불합격 시 같은 조건으로 재생성하기 위해 생성 인자를 보관
-        gen_args.append(
-            (generate, group["topic"], wrong_context, avoid, angle, answer_pos))
+        specs.append({
+            "generate": (
+                _generate_review_ox
+                if group["question_type"] == "OX"
+                else _generate_review_mc
+            ),
+            "topic": group["topic"],
+            "key": key,
+            "wrong_context": wrong_context,
+            "angle": angle,
+            # 정답 위치는 주제별이 아니라 **세트 전체 순번**으로 돌린다.
+            # 주제별로 돌리면 주제가 5개일 때 모두 0번째 슬롯이라 전부 1번이 된다.
+            "answer_pos": answer_pos_for(set_index),
+            "category_code": mapping.get("category_code"),
+            "detail_codes": detail_codes,
+            "primary_detail_code": detail_codes[0] if detail_codes else None,
+        })
+
+    def make(i: int, avoid: list[str], angle: str = ""):
+        spec = specs[i]
+
+        async def _make() -> dict:
+            return await spec["generate"](
+                user, spec["topic"], spec["wrong_context"], avoid,
+                angle or spec["angle"], spec["answer_pos"])
+
+        return _make
+
+    questions = await generate_all([make(i, []) for i in range(len(specs))])
+
+    # 1단계에는 avoid 힌트가 없었으므로 겹친 것만 골라 다시 만든다.
+    # 재시도는 세트 밖 관점으로 민다 - 같은 관점이면 같은 문제가 또 나온다.
+    async def retry_dup(i: int, avoid: list[str]) -> dict:
+        return await make(
+            i, avoid, angle_for(slot_index[specs[i]["key"]] + REVIEW_QUIZ_COUNT))()
+
+    await resolve_duplicates(questions, retry_dup, user)
+
+    for question, spec in zip(questions, specs):
+        question["category_code"] = spec["category_code"]
+        question["detail_codes"] = spec["detail_codes"]
+        question["primary_detail_code"] = spec["primary_detail_code"]
+
+    # 검증에서 불합격 시 같은 조건으로 재생성하기 위해 생성 인자를 보관한다.
+    # avoid 는 확정된 세트 전체 - 재생성본이 나머지와 겹치지 않게 한다.
+    final_texts = [q["question_text"] for q in questions]
+    gen_args = [
+        (spec["generate"], spec["topic"], spec["wrong_context"],
+         [t for j, t in enumerate(final_texts) if j != i],
+         spec["angle"], spec["answer_pos"])
+        for i, spec in enumerate(specs)
+    ]
 
     await _revalidate_and_fix(questions, gen_args, user)
     # 검증·재생성이 끝난 확정본만 저장한다
@@ -491,41 +515,12 @@ async def generate_quiz_from_wrong_answers(
     return questions
 
 
-async def _less_duplicated(first: dict, retry: dict, seen_texts: list[str]) -> dict:
-    """중복으로 걸린 원본과 재시도본 중 세트와 덜 겹치는 쪽을 고른다.
-
-    재시도가 항상 나은 게 아니다 (실측: 0.846 으로 걸렀는데 재시도가 0.920).
-    """
-    if not seen_texts:
-        return retry
-    first_score = await bank.max_similarity_in_set(first["question_text"], seen_texts)
-    retry_score = await bank.max_similarity_in_set(retry["question_text"], seen_texts)
-    if retry_score <= first_score:
-        return retry
-    logger.info(
-        f"재시도가 더 겹쳐 원본 유지 (원본 {first_score:.3f} < 재시도 {retry_score:.3f})"
-    )
-    return first
-
-
-async def _is_duplicate(text: str, seen_texts: list[str], user: UserContext) -> bool:
-    """세 단계로 본다: 세트 내 문자 유사도 -> 세트 내 의미 유사도 -> 과거 문제.
-
-    비용이 싼 순서다. 앞에서 걸리면 뒤는 건너뛴다.
-    """
-    if is_near_duplicate(text, seen_texts):
-        logger.info(f"세트 내 중복 감지(문자) - 재생성: {text[:40]}")
-        return True
-    if await bank.is_duplicate_in_set(text, seen_texts):
-        return True
-    return await bank.is_duplicate_of_past(text, user.user_id)
-
-
 async def _revalidate_and_fix(
     questions: list[dict], gen_args: list[tuple], user: UserContext,
 ) -> None:
     """정답/해설이 모순된 문제를 찾아 같은 조건으로 1회 재생성한다 (in-place 수정).
 
+    세트 전체를 LLM 1회 호출로 검사하고, 불합격 건은 **동시에** 다시 만든다.
     재생성본은 다시 검증하지 않는다. 검증 호출이 계속 늘어나는 것을 막기 위한
     타협이며, 재생성으로도 안 고쳐지면 원본보다 나빠질 이유는 없으므로 채택한다.
     """
@@ -536,15 +531,9 @@ async def _revalidate_and_fix(
         return
 
     logger.warning(f"검증 불합격 {len(failed)}건 - 재생성: {list(failed.values())}")
-    for idx, reason in failed.items():
+
+    async def retry_failed(idx: int) -> dict:
         generate, topic, wrong_context, avoid, angle, answer_pos = gen_args[idx]
-        try:
-            fixed = await generate(user, topic, wrong_context, avoid, angle, answer_pos)
-        except ValueError as e:
-            # 재생성 실패 시 원본 유지 - 문제 개수는 항상 맞춰야 한다
-            logger.warning(f"{idx + 1}번 재생성 실패 - 원본 유지: {e}")
-            continue
-        # 카테고리 매핑은 주제 기준이라 원본 것을 그대로 승계한다
-        for field in ("category_code", "detail_codes", "primary_detail_code"):
-            fixed[field] = questions[idx][field]
-        questions[idx] = fixed
+        return await generate(user, topic, wrong_context, avoid, angle, answer_pos)
+
+    await regenerate_failed(questions, failed, retry_failed)
