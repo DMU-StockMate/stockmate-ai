@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 
@@ -8,8 +8,22 @@ class Message(BaseModel):
 
 
 class UserContext(BaseModel):
-    user_id: int
-    investment_level: str = "미설정"
+    user_id: int = Field(
+        description="사용자 ID. 생성된 문제를 이 사용자 앞으로 기록하는 데 쓴다.",
+        examples=[1],
+    )
+    investment_level: str = Field(
+        default="미설정",
+        description=(
+            "사용자 투자 등급. **아래 다섯 값 중 하나여야 한다.**\n\n"
+            "`입문` | `초급` | `중급` | `고급` | `미설정`\n\n"
+            "문제 난이도와, 프롬프트 퀴즈에서 주제를 찾을 카테고리 범위를 결정한다. "
+            "다른 문자열(`unset`, `BEGINNER` 등)을 보내면 오류는 나지 않지만 "
+            "**전체 카탈로그를 뒤지게 되어 주제 매핑 품질이 떨어진다.** "
+            "DB 의 등급명이 이 다섯 값과 다르면 백엔드에서 변환해 보낼 것."
+        ),
+        examples=["초급"],
+    )
 
 
 class Choice(BaseModel):

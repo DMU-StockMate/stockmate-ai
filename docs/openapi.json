@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "StockMate AI",
-    "description": "StockMate AI 마이크로서비스.\n\n**인증**: `/health` 를 제외한 모든 엔드포인트는 `X-API-Key` 헤더가 필요합니다.\n(`Authorization: Bearer <키>` 형식도 허용)\n\n서버의 `AI_API_KEY` 환경변수가 비어 있으면 인증이 비활성화됩니다(로컬 개발용).",
+    "description": "\n백엔드(NestJS)가 호출하는 AI 마이크로서비스입니다.\n**연동 전에 아래 4가지를 먼저 읽어 주세요. 실제로 사고가 났던 부분입니다.**\n\n---\n\n### 1. 인증\n\n모든 요청에 `X-API-Key` 헤더가 필요합니다.\n예외: `/health`, `/docs`, `/redoc`, `/openapi.json` (키 없이 열림)\n\n```\nX-API-Key: <AI_API_KEY>\n```\n\n키가 없으면 **401** 이고, 이때는 문제 생성이 아예 시작되지 않습니다.\n`Authorization: Bearer <키>` 형식도 허용합니다.\n서버의 `AI_API_KEY` 환경변수가 비어 있으면 인증이 비활성화됩니다(로컬 개발용).\n\n### 2. 응답이 오래 걸립니다 — 그리고 200 이어도 실패일 수 있습니다\n\n문제 생성은 **30초~3분**이 걸립니다. RunPod 프록시(Cloudflare)가\n응답 첫 바이트까지 100초만 기다렸다가 `HTTP 524` 로 끊기 때문에,\n서버는 **30초가 지나면 응답을 먼저 열고 10초마다 공백을 흘려보낸 뒤**\n마지막에 본문을 채웁니다.\n\n- JSON 값 앞의 공백은 문법상 무시되므로(RFC 8259) **파싱 코드는 그대로 두면 됩니다.**\n  `JSON.parse`, axios 기본 동작 모두 정상 동작합니다.\n- 다만 **헤더를 먼저 보낸 뒤에는 상태 코드를 바꿀 수 없습니다.**\n  그래서 30초가 지난 뒤에 생성이 실패하면 500 이 아니라\n  **200 에 실패 본문**이 옵니다.\n\n```jsonc\n// 성공\n{ \"questions\": [ ... ] }\n\n// 실패 (30초 넘긴 뒤 실패한 경우)\n{ \"detail\": \"묶음 문제 생성 실패: ...\", \"error_type\": \"ValueError\", \"keepalive_error\": true }\n```\n\n**`questions` 키의 유무로 판정하세요.** 30초 안에 난 실패는 예전 그대로\n422 / 500 로 옵니다.\n\n```ts\nif (!res.data?.questions) {\n  throw new InternalServerErrorException(res.data?.detail ?? 'AI 문제 생성 실패');\n}\n```\n\n### 3. 재시도하지 마세요\n\n- **500**: 서버가 이미 LLM 을 3번 호출하고 실패한 결과입니다.\n- **524**: 서버는 그 요청을 **계속 처리 중**입니다. 재시도하면 GPU 를 두 배로 씁니다.\n\n둘 다 사용자에게 **\"다시 시도\" 버튼**을 주는 쪽이 맞습니다.\n\n### 4. 타임아웃은 넉넉히\n\n클라이언트 타임아웃은 **180초 이상**으로 두세요. 동시 사용자가 몰리면\n프롬프트 퀴즈가 300초를 넘길 수도 있습니다. 앞단에 nginx 등 리버스 프록시가\n있다면 **거기 타임아웃도 같이 늘려야 합니다** (기본 60초에서 잘립니다).\n\n| 엔드포인트 | 파드 실측 |\n|---|---|\n| `POST /quiz/generate` count=1 | 18~30초 |\n| `POST /quiz/generate` count=5 | 43~62초 |\n| `POST /quiz/generate/prompt` | 60~140초 |\n| `POST /quiz/generate/review` | 33~50초 |\n| `POST /chat/stream` 첫 글자 | 2.4초 |\n| `POST /chat/evaluate` | 약 35초 |\n",
     "version": "0.1.0"
   },
   "paths": {
@@ -125,7 +125,7 @@
           "quiz"
         ],
         "summary": "AI 퀴즈 문제 생성",
-        "description": "LLM을 사용해 사용자 수준에 맞는 주식 투자 퀴즈 문제를 생성합니다.\n\n**지원 문제 유형**\n\nOX 문제 (quiz_type: \"OX\")\n- O/X 2개 선택지\n- choice_no 1 = O, choice_no 2 = X\n\n객관식 4지선다 (quiz_type: \"MULTIPLE_CHOICE\")\n- 4개 선택지\n- choice_no 1~4\n\n**investment_level별 난이도**\n- 입문: 주식, 배당 등 아주 기초 개념\n- 초급: PER, PBR, ROE 등 기본 지표\n- 중급: 재무제표 해석, 투자 전략\n- 고급: 심화 분석, 고급 전략\n\n**topic 미입력시** 수준에 맞는 주제 자동 선택\n\n**count** (기본값 1)\n- 같은 topic으로 count개 문제를 한 번에 생성합니다.\n- 응답은 항상 `questions` 배열입니다 (count=1이어도 배열 안에 1개).\n- 순차 생성이라 count가 클수록 응답 시간이 비례해서 늘어납니다.\n\n**주의사항**\n- LLM이 생성하므로 문제 1개당 최대 3번 재시도\n- 재시도 후에도 실패시 500 에러 반환",
+        "description": "LLM을 사용해 사용자 수준에 맞는 주식 투자 퀴즈 문제를 생성합니다.\n\n**지원 문제 유형**\n\nOX 문제 (quiz_type: \"OX\")\n- O/X 2개 선택지\n- choice_no 1 = O, choice_no 2 = X\n\n객관식 4지선다 (quiz_type: \"MULTIPLE_CHOICE\")\n- 4개 선택지\n- choice_no 1~4\n\n**investment_level별 난이도**\n- 입문: 주식, 배당 등 아주 기초 개념\n- 초급: PER, PBR, ROE 등 기본 지표\n- 중급: 재무제표 해석, 투자 전략\n- 고급: 심화 분석, 고급 전략\n\n**topic 미입력시** 수준에 맞는 주제 자동 선택\n\n**count** (기본값 1)\n- 같은 topic으로 count개 문제를 한 번에 생성합니다.\n- 응답은 항상 `questions` 배열입니다 (count=1이어도 배열 안에 1개).\n- 순차 생성이라 count가 클수록 응답 시간이 비례해서 늘어납니다.\n\n**주의사항**\n- LLM이 생성하므로 문제 1개당 최대 3번 재시도\n- 재시도 후에도 실패시 500 에러 반환\n\n---\n\n### ⚠️ 200 이어도 실패일 수 있습니다\n\n응답이 30초를 넘기면 서버가 **먼저 200 헤더를 보내고** 10초마다 공백을 흘려보낸 뒤\n마지막에 본문을 채웁니다(프록시가 100초에서 끊는 것을 막기 위해서). 헤더를 보낸\n뒤에는 상태 코드를 바꿀 수 없으므로, 그 뒤에 실패하면 500 이 아니라 **200 에 실패\n본문**이 옵니다.\n\n```jsonc\n{ \"detail\": \"...\", \"error_type\": \"ValueError\", \"keepalive_error\": true }\n```\n\n**`questions` 키의 유무로 판정하세요.** 30초 안에 난 실패는 그대로 422 / 500 입니다.\nJSON 앞에 붙는 공백은 표준 파서가 무시하므로 파싱 코드는 손댈 필요가 없습니다.",
         "operationId": "generate_quiz_generate_post",
         "requestBody": {
           "content": {
@@ -249,7 +249,7 @@
           "quiz"
         ],
         "summary": "프롬프트 기반 AI 퀴즈 문제 생성",
-        "description": "사용자가 입력한 자유 프롬프트를 AI가 분석해 주제를 파악하고 퀴즈 문제를 생성합니다.\n\n**동작 방식 (2단계)**\n\n1. 분석: 프롬프트에서 출제 주제·문제 개수·문제 유형을 파악하고,\n   요청으로 받은 카테고리/상세 코드 목록에 매핑한 출제 계획을 세웁니다.\n2. 생성: 계획의 각 항목을 **동시에** 실제 문제로 생성합니다.\n\n**문제 개수**\n- 프롬프트에 개수가 명시되면 그 개수로 생성 (예: \"PER 문제 3개 만들어줘\" → 3개)\n- 명시가 없으면 기본 3개 (서버 설정 `PROMPT_QUIZ_DEFAULT_COUNT`)\n- 최대 10개 (초과 요청 시 10개로 제한)\n\n⚠️ **개수가 많으면 프록시 타임아웃 위험이 있습니다.**\n이 경로는 LLM을 `1(분석) + N(생성) + 1(검증)`번 호출하고, 생성은 서버 설정\n(`QUIZ_GEN_CONCURRENCY`, 기본 5)만큼씩 나눠서 동시에 돕니다. 파드 실측 기준:\n\n| 문제 수 | 라운드 | 실측/추정 |\n|---|---|---|\n| 3개 | 3 | 약 60초 |\n| 5개 | 3 | **84.9초 (실측)** |\n| 10개 | 4 (생성 2파도) | 약 88초 |\n\nRunPod HTTP 프록시(Cloudflare)는 **100초에서 524로 끊습니다**(2026-09-05 실측).\n사용자가 고를 수 있는 개수를 **5 이하로 제한**하는 것을 권장합니다.\n\n**여러 주제**\n- 프롬프트에 여러 주제가 있으면 주제별로 고르게 나눠 생성합니다.\n  (예: \"PER이랑 분산투자 문제 내줘\" → PER/분산투자 문제 혼합)\n\n**문제 유형**\n- 프롬프트에서 파악: \"OX로 내줘\" → OX, 언급 없으면 전부 객관식(4지선다)\n- \"섞어서 내줘\" 같은 요청이면 문제별로 유형이 다를 수 있습니다.\n\n**카테고리 등급 필터링**\n- 카테고리 매핑 시 사용자의 investment_level과 같은 등급의 카테고리를 우선 사용합니다.\n  (초급 유저의 문제가 불필요하게 중급/고급 카테고리로 분류되지 않도록)\n- 입문 유저는 초급 카테고리를 사용합니다 (DB에 입문용 카테고리가 없음).\n- 미설정 유저는 전체 카테고리를 사용합니다.\n- 유저 등급에 없는 주제도 문제 생성이 가능합니다: 예를 들어 초급 유저가\n  \"볼린저밴드 문제\"를 요청하면, 해당 주제만 전체 카테고리 대상으로 재매핑해\n  다른 등급의 category_code(예: INTERMEDIATE_INDICATOR_CONCEPT)로 반환합니다.\n  이때 문제 난이도는 여전히 사용자 수준(초급)에 맞춰 조절됩니다.\n\n**카테고리 매핑 (응답 필드)**\n- 문제마다 `category_code`(1개)와 `detail_codes`(관련 상세 코드 목록)를 반환합니다.\n- `primary_detail_code`: 대표 상세 코드 (`quiz_question_details.is_primary=TRUE` 저장용)\n- 카테고리/상세 코드 목록은 AI 서버에 내장되어 있습니다 (DB `quiz_categories` /\n  `quiz_category_details` 초기 데이터의 미러 — `app/services/quiz/categories.py`).\n  ⚠️ DB에서 카테고리를 추가/수정하면 이 파일도 같이 수정해야 합니다.\n- 내장 목록에 존재하는 코드만 반환합니다 (AI가 지어낸 코드는 검증 단계에서 제거).\n- 적합한 카테고리가 없으면 `category_code`는 null, `detail_codes`는 빈 배열일 수 있습니다.\n- NestJS는 코드로 category_id/detail_id를 조회해 `quiz_questions`,\n  `quiz_question_details`, `quiz_choices`에 저장하면 됩니다.\n\n**주의사항**\n- LLM 생성 특성상 문제 1개당 최대 3회 재시도, 실패 시 500 에러\n- 순차 생성이라 응답 시간은 문제 개수에 비례합니다 (1개당 수 초)",
+        "description": "사용자가 입력한 자유 프롬프트를 AI가 분석해 주제를 파악하고 퀴즈 문제를 생성합니다.\n\n**동작 방식 (2단계)**\n\n1. 분석: 프롬프트에서 출제 주제·문제 개수·문제 유형을 파악하고,\n   요청으로 받은 카테고리/상세 코드 목록에 매핑한 출제 계획을 세웁니다.\n2. 생성: 계획의 각 항목을 **동시에** 실제 문제로 생성합니다.\n\n**문제 개수**\n- 프롬프트에 개수가 명시되면 그 개수로 생성 (예: \"PER 문제 3개 만들어줘\" → 3개)\n- 명시가 없으면 기본 3개 (서버 설정 `PROMPT_QUIZ_DEFAULT_COUNT`)\n- 최대 10개 (초과 요청 시 10개로 제한)\n\n⚠️ **`quiz_type` 과 `count` 는 받지 않습니다.** 보내도 조용히 무시됩니다.\n유형과 개수는 서버가 프롬프트를 읽어서 정합니다. 개수를 지정하고 싶으면\n프롬프트 문장 안에 `\"...5개 만들어줘\"` 처럼 적어 주세요.\n\n⚠️ **주제를 못 찾으면 422 입니다.** 주제는 `user.investment_level` 에 해당하는\n카테고리 안에서만 찾습니다. 초급 사용자가 `당기순이익`(중급 개념)을 요청하면\n카탈로그에 없어 422 가 납니다. 프론트에서 주제를 추천할 때 사용자 등급에 있는\n것만 보여주면 이 실패가 줄어듭니다.\n\n**응답 시간** (파드 실측, 2026-09-08)\n\n| 문제 수 | 시간 |\n|---|---|\n| 3개 (기본) | 약 60초 |\n| 5개 | 62~140초 (변동이 큼) |\n\n프록시의 100초 제한은 하트비트 응답으로 해결됐습니다 — 140초 요청이 정상\n도착하는 것을 확인했습니다. 이제 개수는 **끊기는 문제가 아니라 사용자가\n기다리는 시간**의 문제입니다. 로딩 표시를 꼭 두세요.\n\n**여러 주제**\n- 프롬프트에 여러 주제가 있으면 주제별로 고르게 나눠 생성합니다.\n  (예: \"PER이랑 분산투자 문제 내줘\" → PER/분산투자 문제 혼합)\n\n**문제 유형**\n- 프롬프트에서 파악: \"OX로 내줘\" → OX, 언급 없으면 전부 객관식(4지선다)\n- \"섞어서 내줘\" 같은 요청이면 문제별로 유형이 다를 수 있습니다.\n\n**카테고리 등급 필터링**\n- 카테고리 매핑 시 사용자의 investment_level과 같은 등급의 카테고리를 우선 사용합니다.\n  (초급 유저의 문제가 불필요하게 중급/고급 카테고리로 분류되지 않도록)\n- 입문 유저는 초급 카테고리를 사용합니다 (DB에 입문용 카테고리가 없음).\n- 미설정 유저는 전체 카테고리를 사용합니다.\n- 유저 등급에 없는 주제도 문제 생성이 가능합니다: 예를 들어 초급 유저가\n  \"볼린저밴드 문제\"를 요청하면, 해당 주제만 전체 카테고리 대상으로 재매핑해\n  다른 등급의 category_code(예: INTERMEDIATE_INDICATOR_CONCEPT)로 반환합니다.\n  이때 문제 난이도는 여전히 사용자 수준(초급)에 맞춰 조절됩니다.\n\n**카테고리 매핑 (응답 필드)**\n- 문제마다 `category_code`(1개)와 `detail_codes`(관련 상세 코드 목록)를 반환합니다.\n- `primary_detail_code`: 대표 상세 코드 (`quiz_question_details.is_primary=TRUE` 저장용)\n- 카테고리/상세 코드 목록은 AI 서버에 내장되어 있습니다 (DB `quiz_categories` /\n  `quiz_category_details` 초기 데이터의 미러 — `app/services/quiz/categories.py`).\n  ⚠️ DB에서 카테고리를 추가/수정하면 이 파일도 같이 수정해야 합니다.\n- 내장 목록에 존재하는 코드만 반환합니다 (AI가 지어낸 코드는 검증 단계에서 제거).\n- 적합한 카테고리가 없으면 `category_code`는 null, `detail_codes`는 빈 배열일 수 있습니다.\n- NestJS는 코드로 category_id/detail_id를 조회해 `quiz_questions`,\n  `quiz_question_details`, `quiz_choices`에 저장하면 됩니다.\n\n**주의사항**\n- LLM 생성 특성상 문제 1개당 최대 3회 재시도, 실패 시 500 에러\n- 순차 생성이라 응답 시간은 문제 개수에 비례합니다 (1개당 수 초)\n\n---\n\n### ⚠️ 200 이어도 실패일 수 있습니다\n\n응답이 30초를 넘기면 서버가 **먼저 200 헤더를 보내고** 10초마다 공백을 흘려보낸 뒤\n마지막에 본문을 채웁니다(프록시가 100초에서 끊는 것을 막기 위해서). 헤더를 보낸\n뒤에는 상태 코드를 바꿀 수 없으므로, 그 뒤에 실패하면 500 이 아니라 **200 에 실패\n본문**이 옵니다.\n\n```jsonc\n{ \"detail\": \"...\", \"error_type\": \"ValueError\", \"keepalive_error\": true }\n```\n\n**`questions` 키의 유무로 판정하세요.** 30초 안에 난 실패는 그대로 422 / 500 입니다.\nJSON 앞에 붙는 공백은 표준 파서가 무시하므로 파싱 코드는 손댈 필요가 없습니다.",
         "operationId": "generate_from_prompt_quiz_generate_prompt_post",
         "requestBody": {
           "content": {
@@ -382,7 +382,7 @@
           "quiz"
         ],
         "summary": "오답 기반 AI 퀴즈 문제 생성",
-        "description": "사용자가 그동안 틀린 문제들을 받아, 자주 틀린 주제 위주로 새 문제 5개를 생성합니다.\n\n**동작 방식**\n\n1. 받은 오답들을 주제별로 묶습니다 (`detail_code` 우선, 없으면 `topic`).\n2. 많이 틀린 주제 순으로 정렬한 뒤 5개 슬롯을 배분합니다.\n   많이 틀린 주제가 더 많은 문제를 가져갑니다 (주제 2개면 3:2).\n3. 슬롯마다 해당 주제의 실제 오답을 프롬프트에 넣어 문제를 생성합니다.\n   같은 개념은 유지하고 종목·수치·상황만 바꾸며, 유저가 골랐던 오답의\n   오해를 선택지로 재배치하고 해설에서 짚어줍니다.\n4. 생성된 문제 전체를 한 번에 검증합니다 (정답/해설 모순, 지표 정의 오류,\n   OX 이중부정 등). 불합격 문제만 같은 조건으로 1회 재생성합니다.\n\n**같은 주제에 여러 문제가 배정될 때**\n\n슬롯마다 출제 관점을 강제로 돌립니다 (정의·계산 → 흔한 오해 → 함께 볼 지표\n→ 실제 적용 → 예외 상황). 같은 주제에서 사실상 같은 문제가 반복되는 것을 막습니다.\n\n**문제 개수**\n- 항상 5개 고정입니다 (요청으로 조절 불가).\n\n**NestJS가 보낼 데이터**\n\n`quiz_attempts`에서 `WHERE user_id = ? AND is_correct = FALSE`로 조회한 오답을\n`quiz_questions` / `quiz_choices`와 조인해서 `wrong_answers` 배열에 담아주세요.\n\n- `detail_code` (권장): `quiz_question_details`에서 `is_primary = TRUE`인 행의\n  `quiz_category_details.detail_code`. 주제를 정확히 알 수 있어 품질이 크게 올라갑니다.\n  없으면 `topic` 문자열로 대체되고, 둘 다 없으면 문제 본문에서 추론합니다.\n- `selected_choice_no` (권장): 유저가 고른 오답 번호.\n  이게 있어야 \"무엇을 오해했는지\"를 겨냥한 문제가 나옵니다.\n  없으면 그냥 같은 주제의 평범한 문제가 생성됩니다.\n- 오답 개수 제한은 없지만, 주제당 최대 2개까지만 프롬프트에 사용합니다.\n\n**문제 유형**\n- 주제별로 틀린 문제의 유형을 다수결로 따릅니다.\n  (OX만 틀린 주제는 OX로, 그 외에는 객관식 4지선다)\n\n**응답 형태**\n- `/quiz/generate/prompt`와 **완전히 동일한 스키마**입니다.\n  NestJS는 기존 저장 로직(`category_code`/`detail_codes`/`primary_detail_code` →\n  `quiz_questions`, `quiz_question_details`, `quiz_choices`)을 그대로 재사용하면 됩니다.\n- 저장 시 `source_type='WRONG_ANSWER'`, `visibility='PRIVATE'`,\n  `owner_user_id`=요청 유저로 넣으면 됩니다.\n- ⚠️ AI 생성 문제에는 `reward_cash`를 넣지 마세요. 보상 현금이 모의투자 총자산 →\n  랭킹 수익률로 이어져서, 문제를 반복 생성하면 거래 없이 수익률을 올릴 수 있습니다.\n\n**주의사항**\n- LLM 생성 특성상 문제 1개당 최대 3회 재시도, 실패 시 500 에러\n- 순차 생성이라 응답 시간이 깁니다. LLM 호출은 최소 6회\n  (생성 5 + 검증 1)이며, 중복·검증 불합격 시 더 늘어납니다.\n  `detail_code`를 보내면 카테고리 매핑 호출 1회를 아낄 수 있습니다.\n  프론트에 로딩 처리가 필요합니다.",
+        "description": "사용자가 그동안 틀린 문제들을 받아, 자주 틀린 주제 위주로 새 문제 5개를 생성합니다.\n\n**동작 방식**\n\n1. 받은 오답들을 주제별로 묶습니다 (`detail_code` 우선, 없으면 `topic`).\n2. 많이 틀린 주제 순으로 정렬한 뒤 5개 슬롯을 배분합니다.\n   많이 틀린 주제가 더 많은 문제를 가져갑니다 (주제 2개면 3:2).\n3. 슬롯마다 해당 주제의 실제 오답을 프롬프트에 넣어 문제를 생성합니다.\n   같은 개념은 유지하고 종목·수치·상황만 바꾸며, 유저가 골랐던 오답의\n   오해를 선택지로 재배치하고 해설에서 짚어줍니다.\n4. 생성된 문제 전체를 한 번에 검증합니다 (정답/해설 모순, 지표 정의 오류,\n   OX 이중부정 등). 불합격 문제만 같은 조건으로 1회 재생성합니다.\n\n**같은 주제에 여러 문제가 배정될 때**\n\n슬롯마다 출제 관점을 강제로 돌립니다 (정의·계산 → 흔한 오해 → 함께 볼 지표\n→ 실제 적용 → 예외 상황). 같은 주제에서 사실상 같은 문제가 반복되는 것을 막습니다.\n\n**문제 개수**\n- 항상 5개 고정입니다.\n\n⚠️ **`quiz_type` 과 `count` 는 받지 않습니다.** 보내도 조용히 무시되고\n항상 5개가 옵니다. 유형은 오답의 성격에 맞춰 서버가 정합니다.\n\n**NestJS가 보낼 데이터**\n\n`quiz_attempts`에서 `WHERE user_id = ? AND is_correct = FALSE`로 조회한 오답을\n`quiz_questions` / `quiz_choices`와 조인해서 `wrong_answers` 배열에 담아주세요.\n\n- `detail_code` (권장): `quiz_question_details`에서 `is_primary = TRUE`인 행의\n  `quiz_category_details.detail_code`. 주제를 정확히 알 수 있어 품질이 크게 올라갑니다.\n  없으면 `topic` 문자열로 대체되고, 둘 다 없으면 문제 본문에서 추론합니다.\n- `selected_choice_no` (권장): 유저가 고른 오답 번호.\n  이게 있어야 \"무엇을 오해했는지\"를 겨냥한 문제가 나옵니다.\n  없으면 그냥 같은 주제의 평범한 문제가 생성됩니다.\n- 오답 개수 제한은 없지만, 주제당 최대 2개까지만 프롬프트에 사용합니다.\n\n**문제 유형**\n- 주제별로 틀린 문제의 유형을 다수결로 따릅니다.\n  (OX만 틀린 주제는 OX로, 그 외에는 객관식 4지선다)\n\n**응답 형태**\n- `/quiz/generate/prompt`와 **완전히 동일한 스키마**입니다.\n  NestJS는 기존 저장 로직(`category_code`/`detail_codes`/`primary_detail_code` →\n  `quiz_questions`, `quiz_question_details`, `quiz_choices`)을 그대로 재사용하면 됩니다.\n- 저장 시 `source_type='WRONG_ANSWER'`, `visibility='PRIVATE'`,\n  `owner_user_id`=요청 유저로 넣으면 됩니다.\n- ⚠️ AI 생성 문제에는 `reward_cash`를 넣지 마세요. 보상 현금이 모의투자 총자산 →\n  랭킹 수익률로 이어져서, 문제를 반복 생성하면 거래 없이 수익률을 올릴 수 있습니다.\n\n**주의사항**\n- LLM 생성 특성상 문제 1개당 최대 3회 재시도, 실패 시 500 에러\n- 순차 생성이라 응답 시간이 깁니다. LLM 호출은 최소 6회\n  (생성 5 + 검증 1)이며, 중복·검증 불합격 시 더 늘어납니다.\n  `detail_code`를 보내면 카테고리 매핑 호출 1회를 아낄 수 있습니다.\n  프론트에 로딩 처리가 필요합니다.\n\n---\n\n### ⚠️ 200 이어도 실패일 수 있습니다\n\n응답이 30초를 넘기면 서버가 **먼저 200 헤더를 보내고** 10초마다 공백을 흘려보낸 뒤\n마지막에 본문을 채웁니다(프록시가 100초에서 끊는 것을 막기 위해서). 헤더를 보낸\n뒤에는 상태 코드를 바꿀 수 없으므로, 그 뒤에 실패하면 500 이 아니라 **200 에 실패\n본문**이 옵니다.\n\n```jsonc\n{ \"detail\": \"...\", \"error_type\": \"ValueError\", \"keepalive_error\": true }\n```\n\n**`questions` 키의 유무로 판정하세요.** 30초 안에 난 실패는 그대로 422 / 500 입니다.\nJSON 앞에 붙는 공백은 표준 파서가 무시하므로 파싱 코드는 손댈 필요가 없습니다.",
         "operationId": "generate_from_wrong_answers_quiz_generate_review_post",
         "requestBody": {
           "content": {
@@ -592,7 +592,11 @@
         "properties": {
           "prompt": {
             "type": "string",
-            "title": "Prompt"
+            "title": "Prompt",
+            "description": "사용자가 입력한 자연어 요청. 한국어 문장을 그대로 넣으면 된다.\n\n서버가 이 문장을 읽어 **주제 / 문제 유형 / 개수**를 뽑아낸다.\n\n- 개수: 문장에 `5개` 처럼 적혀 있으면 그 수, 없으면 **3개** (최대 10)\n- 유형: 문장에 OX/객관식 언급이 있으면 그대로, 없으면 서버가 판단\n- 주제: 사용자 `investment_level` 에 해당하는 카테고리 안에서 찾는다.\n  그 범위에 없는 주제면 **422** 가 난다 (예: 초급 사용자가 `당기순이익`)\n\n카테고리 설명 같은 참고 문맥을 앞에 붙여 보내도 되지만, **요청 문장이 문맥에 묻히지 않게** 짧게 유지하는 편이 주제 인식률이 높다.",
+            "examples": [
+              "PER과 PBR의 차이를 확인하는 문제를 5개 만들어줘"
+            ]
           },
           "user": {
             "$ref": "#/components/schemas/UserContext"
@@ -603,7 +607,8 @@
           "prompt",
           "user"
         ],
-        "title": "PromptQuizGenerateRequest"
+        "title": "PromptQuizGenerateRequest",
+        "description": "자유 프롬프트로 문제를 만든다.\n\n⚠️ **`quiz_type` 과 `count` 를 받지 않는다.** 보내도 조용히 무시된다.\n문제 유형과 개수는 서버가 프롬프트를 읽어서 정한다."
       },
       "PromptQuizGenerateResponse": {
         "properties": {
@@ -664,7 +669,11 @@
                 "type": "null"
               }
             ],
-            "title": "Category Code"
+            "title": "Category Code",
+            "description": "이 문제가 속한 카테고리 코드. 백엔드는 이 코드로 `quiz_categories.category_id` 를 조회해 `quiz_questions.category_id` 에 저장하면 된다.",
+            "examples": [
+              "BEGINNER_FINANCIAL_BASIC"
+            ]
           },
           "detail_codes": {
             "items": {
@@ -672,7 +681,13 @@
             },
             "type": "array",
             "title": "Detail Codes",
-            "default": []
+            "description": "이 문제에 연결할 상세 코드 목록. `quiz_question_details` 에 행으로 저장한다.",
+            "default": [],
+            "examples": [
+              [
+                "PER_BASIC"
+              ]
+            ]
           },
           "primary_detail_code": {
             "anyOf": [
@@ -683,7 +698,11 @@
                 "type": "null"
               }
             ],
-            "title": "Primary Detail Code"
+            "title": "Primary Detail Code",
+            "description": "대표 상세 코드. `quiz_question_details.is_primary = TRUE` 로 저장할 대상이다.\n\n**이 값을 저장해 두면** 다음에 그 문제가 오답이 됐을 때 `/quiz/generate/review` 의 `detail_code` 로 그대로 넣을 수 있다.",
+            "examples": [
+              "PER_BASIC"
+            ]
           }
         },
         "type": "object",
@@ -813,7 +832,11 @@
           },
           "quiz_type": {
             "type": "string",
-            "title": "Quiz Type"
+            "title": "Quiz Type",
+            "description": "`OX` 또는 `MULTIPLE_CHOICE`. 이 경로에서는 지정한 유형으로만 생성한다.",
+            "examples": [
+              "MULTIPLE_CHOICE"
+            ]
           },
           "topic": {
             "anyOf": [
@@ -824,12 +847,20 @@
                 "type": "null"
               }
             ],
-            "title": "Topic"
+            "title": "Topic",
+            "description": "출제 주제. **반드시 짧은 주제어여야 한다** (`PER`, `배당수익률`, `부채비율`).\n\n⚠️ **문장이나 지시문을 넣지 말 것.** 생성된 문제가 이 문자열을 실제로 다루는지 검사하는 주제 이탈 가드가 있어서, `\"...문제를 만들어줘\"` 같은 긴 텍스트를 넣으면 매번 이탈 판정 → 재시도 3회 소진 → **500** 이 난다. 생성 자체는 되는데 마지막에 실패하는 형태라 원인 파악이 어렵다.\n\n자유 프롬프트로 만들고 싶으면 `POST /quiz/generate/prompt` 를, 오답 기반이면 `POST /quiz/generate/review` 를 쓸 것.\n\n생략하면 사용자 수준에 맞는 주제를 서버가 고른다.",
+            "examples": [
+              "PER"
+            ]
           },
           "count": {
             "type": "integer",
             "title": "Count",
-            "default": 1
+            "description": "생성할 문제 수. 같은 `topic` 으로 count개를 만든다.\n\n**이 경로에서만 동작한다** (`/prompt`, `/review` 는 받지 않는다).\ncount 를 키우는 것보다 **count=1 요청을 여러 번 병렬로 보내는 편이 빠르다** — GPU 총 작업량은 같은데 요청 하나하나가 짧아진다.",
+            "default": 1,
+            "examples": [
+              1
+            ]
           }
         },
         "type": "object",
@@ -890,7 +921,8 @@
               "$ref": "#/components/schemas/WrongAnswerItem"
             },
             "type": "array",
-            "title": "Wrong Answers"
+            "title": "Wrong Answers",
+            "description": "유저가 틀린 문제들. `WHERE user_id = ? AND is_correct = FALSE` 로 조회한 결과를 이 형태로 담는다. 빈 배열이면 **422**.\n\n여러 개를 넣으면 서버가 주제별로 묶어 5문제를 배분한다."
           }
         },
         "type": "object",
@@ -898,7 +930,8 @@
           "user",
           "wrong_answers"
         ],
-        "title": "ReviewQuizGenerateRequest"
+        "title": "ReviewQuizGenerateRequest",
+        "description": "오답 기록으로 복습 문제를 만든다.\n\n⚠️ **`quiz_type` 과 `count` 를 받지 않는다.** 보내도 조용히 무시된다.\n응답은 **항상 5문제**이고, 유형은 오답의 성격에 맞춰 서버가 정한다."
       },
       "ReviewQuizGenerateResponse": {
         "properties": {
@@ -921,12 +954,20 @@
         "properties": {
           "user_id": {
             "type": "integer",
-            "title": "User Id"
+            "title": "User Id",
+            "description": "사용자 ID. 생성된 문제를 이 사용자 앞으로 기록하는 데 쓴다.",
+            "examples": [
+              1
+            ]
           },
           "investment_level": {
             "type": "string",
             "title": "Investment Level",
-            "default": "미설정"
+            "description": "사용자 투자 등급. **아래 다섯 값 중 하나여야 한다.**\n\n`입문` | `초급` | `중급` | `고급` | `미설정`\n\n문제 난이도와, 프롬프트 퀴즈에서 주제를 찾을 카테고리 범위를 결정한다. 다른 문자열(`unset`, `BEGINNER` 등)을 보내면 오류는 나지 않지만 **전체 카탈로그를 뒤지게 되어 주제 매핑 품질이 떨어진다.** DB 의 등급명이 이 다섯 값과 다르면 백엔드에서 변환해 보낼 것.",
+            "default": "미설정",
+            "examples": [
+              "초급"
+            ]
           }
         },
         "type": "object",
@@ -1002,11 +1043,13 @@
         "properties": {
           "question_text": {
             "type": "string",
-            "title": "Question Text"
+            "title": "Question Text",
+            "description": "유저가 틀린 문제의 본문."
           },
           "question_type": {
             "type": "string",
             "title": "Question Type",
+            "description": "`OX` | `MULTIPLE_CHOICE`",
             "default": "MULTIPLE_CHOICE"
           },
           "explanation": {
@@ -1018,7 +1061,8 @@
                 "type": "null"
               }
             ],
-            "title": "Explanation"
+            "title": "Explanation",
+            "description": "원래 문제의 해설. 있으면 오해 지점을 더 정확히 겨냥한다."
           },
           "topic": {
             "anyOf": [
@@ -1029,7 +1073,11 @@
                 "type": "null"
               }
             ],
-            "title": "Topic"
+            "title": "Topic",
+            "description": "원래 문제의 주제명. `detail_code` 가 없을 때의 대체 수단이다.",
+            "examples": [
+              "PER"
+            ]
           },
           "detail_code": {
             "anyOf": [
@@ -1040,7 +1088,11 @@
                 "type": "null"
               }
             ],
-            "title": "Detail Code"
+            "title": "Detail Code",
+            "description": "**카탈로그 상세 코드.** `quiz_question_details` 에서 `is_primary=TRUE` 인 행의 `quiz_category_details.detail_code` 를 넣는다.\n\n⚠️ **주제 이름이 아니라 코드다.** `PER` ❌ / `PER_BASIC` ⭕, `ROE` ❌ / `ROE_BASIC` ⭕. 코드 목록은 AI 서버의 `app/services/quiz/categories.py` 에 있고 DB `quiz_category_details` 와 같아야 한다.\n\n이 값이 맞으면 서버가 카탈로그에서 바로 역추적해 **LLM 매핑 호출 1회를 통째로 건너뛴다** (파드 실측 약 20초 단축).\n\n틀린 코드를 넣으면 오류는 안 나지만 조용히 무시되고 문제 본문에서 주제를 추론하게 되는데, 이때 엉뚱한 주제로 흘러 **500** 이 날 수 있다.",
+            "examples": [
+              "PER_BASIC"
+            ]
           },
           "choices": {
             "items": {
@@ -1048,6 +1100,7 @@
             },
             "type": "array",
             "title": "Choices",
+            "description": "원래 문제의 선택지 전체. `is_correct` 로 정답을 표시한다.",
             "default": []
           },
           "selected_choice_no": {
@@ -1059,7 +1112,11 @@
                 "type": "null"
               }
             ],
-            "title": "Selected Choice No"
+            "title": "Selected Choice No",
+            "description": "유저가 고른 (틀린) 선택지 번호. **이게 있어야 '무엇을 오해했는지'를 겨냥한 문제를 만들 수 있다.** 가능하면 꼭 채워 보낼 것.",
+            "examples": [
+              1
+            ]
           }
         },
         "type": "object",
