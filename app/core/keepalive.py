@@ -40,15 +40,21 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
+import time
 from typing import Any, Awaitable
 
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
+from app.core.logger import setup_logger
 
-logger = logging.getLogger(__name__)
+# ⚠️ 반드시 setup_logger 를 쓴다. 예전에는 logging.getLogger(__name__) 이었는데,
+# 이 프로젝트는 로거마다 핸들러를 직접 붙이는 구조(app/core/logger.py)라
+# 맨 getLogger 에는 핸들러도 레벨도 없어서 **INFO 로그가 통째로 사라졌다.**
+# 2026-09-08 연동 디버깅에서 "하트비트가 실제로 발동했는가"를 서버 로그로
+# 확인할 수 없어 원인 추적이 한참 늦어졌다.
+logger = setup_logger(__name__)
 
 # 한 박동에 흘려보내는 공백 덩어리.
 # 32바이트로 둔 것은 중간 프록시가 아주 작은 쓰기를 모아 둘 가능성을 피하려는
@@ -86,13 +92,20 @@ async def json_with_keepalive(coro: Awaitable[Any], *, label: str = "요청") ->
     delay = settings.RESPONSE_KEEPALIVE_DELAY_SEC
     interval = settings.RESPONSE_KEEPALIVE_INTERVAL_SEC
 
+    started = time.monotonic()
     task = asyncio.ensure_future(coro)
     done, _ = await asyncio.wait({task}, timeout=delay)
     if task in done:
         # 제시간에 끝났다. 예외라면 여기서 그대로 올라가 라우터의 except 가 받는다.
+        elapsed = time.monotonic() - started
+        if task.exception() is None:
+            logger.info(f"{label}: {elapsed:.1f}초에 완료 (하트비트 없이)")
         return task.result()
 
-    logger.info(f"{label}: {delay:.0f}초를 넘겨 하트비트 응답으로 전환한다")
+    logger.info(
+        f"{label}: {delay:.0f}초를 넘겨 하트비트 응답으로 전환한다 "
+        f"(여기서 200 헤더가 나갔으므로 이후 실패는 200 + keepalive_error 로 나간다)"
+    )
 
     async def _stream():
         beats = 0
@@ -108,7 +121,8 @@ async def json_with_keepalive(coro: Awaitable[Any], *, label: str = "요청") ->
             # 이미 200 헤더를 내보낸 뒤라 상태 코드를 바꿀 수 없다.
             # 성공 응답과 구분되도록 questions 없는 에러 본문을 내보낸다.
             logger.error(
-                f"{label}: 하트비트 {beats}회 뒤 실패 - 에러 본문을 반환한다: {e}",
+                f"{label}: 실패 {time.monotonic() - started:.1f}초 "
+                f"(하트비트 {beats}회) - 에러 본문을 반환한다: {e}",
                 exc_info=True,
             )
             body = encode_json({
@@ -121,9 +135,15 @@ async def json_with_keepalive(coro: Awaitable[Any], *, label: str = "요청") ->
             # 아무도 안 받을 응답을 위해 GPU 를 더 태울 이유가 없다.
             if not task.done():
                 task.cancel()
-                logger.warning(f"{label}: 수신 측이 끊어 생성 작업을 취소했다")
+                logger.warning(
+                    f"{label}: 수신 측이 {time.monotonic() - started:.1f}초에 끊어 "
+                    "생성 작업을 취소했다 (백엔드/프론트/리버스 프록시 타임아웃을 의심할 것)"
+                )
 
-        logger.info(f"{label}: 하트비트 {beats}회 뒤 본문 {len(body)}바이트 전송")
+        logger.info(
+            f"{label}: 완료 {time.monotonic() - started:.1f}초 "
+            f"(하트비트 {beats}회, 본문 {len(body)}바이트)"
+        )
         yield body
 
     return StreamingResponse(_stream(), media_type="application/json")

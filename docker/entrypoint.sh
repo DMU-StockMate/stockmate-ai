@@ -87,6 +87,9 @@ wait_for "vLLM" "http://127.0.0.1:${VLLM_PORT}/health" 1500
 # 워커는 1개로 둔다. 늘리면 bge-m3 임베딩 모델이 워커 수만큼 GPU 에 중복
 # 적재되어 vLLM 이 쓸 VRAM 을 갉아먹는다. 앱은 async 라 1워커로 충분하다.
 log "FastAPI 시작 (:${APP_PORT}, embedding=${EMBEDDING_DEVICE})"
+# --no-access-log 를 뺐다. 2026-09-08 연동 디버깅에서 "어떤 요청이 몇 초에
+# 어떤 상태 코드로 끝났는지"를 파드 로그로 전혀 알 수 없어 원인 추적이
+# 한참 늦어졌다. 요청량이 분당 수십 건 수준이라 로그 비용은 문제가 안 된다.
 exec uvicorn app.main:app \
   --host 0.0.0.0 --port "${APP_PORT}" \
-  --workers 1 --no-access-log 2>&1 | sed -u 's/^/[app] /'
+  --workers 1 2>&1 | sed -u 's/^/[app] /'
