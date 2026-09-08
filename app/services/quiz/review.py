@@ -22,7 +22,9 @@ from app.schemas.quiz import WrongAnswerItem
 from app.services.quiz import bank
 from app.services.quiz.categories import QUIZ_CATEGORY_CATALOG
 from app.services.quiz.generator import LEVEL_GUIDE, _map_topics_to_catalog
+from app.core.config import settings
 from app.services.quiz.concurrency import (
+    fire_and_forget,
     generate_all,
     regenerate_failed,
     resolve_duplicates,
@@ -524,6 +526,15 @@ async def _revalidate_and_fix(
     재생성본은 다시 검증하지 않는다. 검증 호출이 계속 늘어나는 것을 막기 위한
     타협이며, 재생성으로도 안 고쳐지면 원본보다 나빠질 이유는 없으므로 채택한다.
     """
+    mode = (settings.QUIZ_VALIDATE_MODE or "blocking").strip().lower()
+    if mode == "off":
+        return
+    if mode == "background":
+        from app.services.quiz.generator import report_validation
+
+        fire_and_forget(report_validation(list(questions), "review"), "사후 검증")
+        return
+
     failed = await validate_questions(questions)
 
     if not failed:

@@ -14,7 +14,8 @@ from app.core.config import settings
 
 
 def build_llm(temperature: float, num_predict: int = 1024, num_ctx: int = 6144,
-              reasoning_effort: str | None = None):
+              reasoning_effort: str | None = None,
+              max_tokens: int | None = None):
     """설정된 백엔드에 맞는 LangChain 채팅 모델을 만든다.
 
     num_ctx 는 Ollama 전용이다. llama-server 는 서버 기동 시 -c 로 정하므로
@@ -52,7 +53,10 @@ def build_llm(temperature: float, num_predict: int = 1024, num_ctx: int = 6144,
             api_key=settings.LLM_API_KEY,
             model=settings.LLM_MODEL,
             temperature=temperature,
-            max_tokens=(settings.LLM_MAX_TOKENS or num_predict),
+            # 우선순위: 호출부가 명시한 값 > 전역 설정 > 함수 기본값.
+            # 묶음 생성처럼 출력이 문제 수에 비례하는 호출이 자기 예산을 직접
+            # 정할 수 있어야 한다. 전역값을 올리면 채팅 응답까지 길어진다.
+            max_tokens=(max_tokens or settings.LLM_MAX_TOKENS or num_predict),
             extra_body=extra_body or None,
         )
 

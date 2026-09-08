@@ -11,6 +11,7 @@ LLM은 호출하지 않는다. langchain 체인을 스텁으로 갈아끼워 프
 """
 import asyncio
 import json
+import re
 import math
 import sys
 import types
@@ -30,6 +31,7 @@ VALIDATE_RESULT: dict = {"results": []}
 BANK_SIMILARITY = None   # 퀴즈 뱅크가 돌려줄 유사도 (None이면 결과 없음)
 BANK_UPSERTS: list = []  # 뱅크에 저장된 호출 기록
 BANK_TOPIC_COUNT = 0     # 관점 오프셋용 - 주제별 기존 문제 수
+FALLBACK_SEQ = 0         # 폴백 문장 순번 - 덩어리가 나뉘어도 겹치지 않게 한다
 
 
 class _Resp:
@@ -78,6 +80,35 @@ def _obey_answer_pos(raw: str, prompt_vars: dict) -> str:
                        f'"correct_no": {prompt_vars.get("answer_pos", 1)}')
 
 
+# 묶음 프롬프트("정확히 N개 생성")에 대한 스텁 응답.
+#
+# 실제 모델은 questions 배열로 N개를 한 번에 준다. 기존 테스트들이 RESPONSES 로
+# 개별 문제를 넣어 검사하고 있으므로, 묶음에서도 RESPONSES 를 앞에서부터
+# 꺼내 배열로 조립한다. 그래야 "지시 위반 시 재생성" 같은 기존 시나리오가
+# 묶음 경로에서도 그대로 성립한다.
+def _batch_response(tmpl, kwargs) -> str:
+    count = int(kwargs.get("count", 1))
+    # 슬롯 블록에서 지정된 정답 위치를 뽑아 각 문제에 적용한다
+    positions = [int(m) for m in re.findall(r"정답은 반드시 (\d)번", kwargs.get("slot_block", ""))]
+    items = []
+    for i in range(count):
+        if RESPONSES:
+            raw = RESPONSES.pop(0)
+        else:
+            # 전역 순번을 쓴다. 호출 수로 계산하면 덩어리가 병렬로 돌 때
+            # 같은 문장이 두 덩어리에 나와 스텁이 스스로 중복을 만든다.
+            global FALLBACK_SEQ
+            text = _FALLBACK[FALLBACK_SEQ % len(_FALLBACK)]
+            FALLBACK_SEQ += 1
+            raw = (_ox(text.rstrip("?는은") + " 라고 볼 수 있다.")
+                   if tmpl.is_ox else _mc(text))
+        item = json.loads(raw)
+        if not tmpl.is_ox and item.get("correct_no") is None:
+            item["correct_no"] = positions[i] if i < len(positions) else 1
+        items.append(item)
+    return json.dumps({"questions": items}, ensure_ascii=False)
+
+
 def _install_stubs():
     lc_core = types.ModuleType("langchain_core")
     lc_prompts = types.ModuleType("langchain_core.prompts")
@@ -96,7 +127,10 @@ def _install_stubs():
             else:
                 obj.kind = "generate"
             # 폴백 응답을 프롬프트 유형에 맞게 내기 위한 표시
-            obj.is_ox = "OX 문제를 1개 생성" in template
+            obj.is_ox = ("OX 문제를 1개 생성" in template
+                         or "OX 문제를 **정확히" in template)
+            # 한 번에 여러 문제를 만드는 묶음 프롬프트인지
+            obj.is_batch = "정확히 {count}개** 생성" in template
             return obj
 
         def __or__(self, other):
@@ -113,6 +147,8 @@ def _install_stubs():
                 return _Resp(json.dumps(ANALYZE_RESULT, ensure_ascii=False))
             if self.kind == "map":
                 return _Resp(json.dumps({"mappings": []}, ensure_ascii=False))
+            if self.is_batch:
+                return _Resp(_batch_response(self, kwargs))
             if RESPONSES:
                 return _Resp(_obey_answer_pos(RESPONSES.pop(0), kwargs))
             n = len([c for c in CALLS if c["kind"] == "generate"])
@@ -157,6 +193,13 @@ def _install_stubs():
         QUIZ_DUP_CHECK_PAST = False
         # 프롬프트 경로의 기본 문제 수 (운영 기본값과 동일).
         PROMPT_QUIZ_DEFAULT_COUNT = 3
+        # 검증 모드. 테스트는 재생성 동작까지 보므로 blocking 으로 둔다
+        # (운영 기본값 background 는 test_validate_mode 가 따로 본다).
+        QUIZ_VALIDATE_MODE = "blocking"
+        ANALYZE_REASONING_EFFORT = ""
+        QUIZ_BATCH_MAX = 3
+        QUIZ_BATCH_TOKENS_PER_ITEM = 900
+        LLM_MAX_TOKENS = 4096
 
 
     # Qdrant / 임베딩 스텁 - 퀴즈 뱅크가 실제 서버를 찾지 않게 한다
@@ -202,6 +245,8 @@ def check(name, passed, extra=""):
 
 
 def reset(responses=None, analyze=None, validate=None):
+    global FALLBACK_SEQ
+    FALLBACK_SEQ = 0
     CALLS.clear()
     RESPONSES.clear()
     if responses:
@@ -213,6 +258,35 @@ def reset(responses=None, analyze=None, validate=None):
 
 def gen_calls():
     return [c for c in CALLS if c["kind"] == "generate"]
+
+
+# 묶음 생성으로 바뀌면서 프롬프트 변수가 달라졌다.
+#   단건: {"angle": ..., "avoid_block": ..., "answer_pos": ...}
+#   묶음: {"slot_block": "[1번 문제]\n<관점>\n→ 정답은 반드시 N번 ...", "count": N}
+# 기존 테스트들의 검증 의도(관점 회전·정답 위치 분산)를 그대로 살리기 위해
+# 두 형태를 모두 읽는 헬퍼를 둔다.
+
+def angles_of(call) -> list:
+    """호출 하나가 지시한 출제 관점들 (단건이면 1개)."""
+    sb = call.get("slot_block")
+    if not sb:
+        return [call["angle"]] if call.get("angle") else []
+    return [b.strip() for b in
+            re.findall(r"\[\d+번 문제\]\n(.*?)(?=\n→|\n\[|\Z)", sb, re.S)]
+
+
+def positions_of(call) -> list:
+    """호출 하나가 지시한 정답 위치들."""
+    sb = call.get("slot_block")
+    if not sb:
+        return [call["answer_pos"]] if call.get("answer_pos") else []
+    return [int(m) for m in re.findall(r"정답은 반드시 (\d)번", sb)]
+
+
+def all_angles(calls=None) -> list:
+    """생성 호출 전체가 지시한 관점을 순서대로 편다."""
+    return [a for c in (calls if calls is not None else gen_calls())
+            for a in angles_of(c)]
 
 
 # =========================================================
@@ -284,21 +358,31 @@ def test_generate_batch():
     qs = asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=3))
     check("count 유지", len(qs) == 3, len(qs))
     check("검증 호출 1회", len([c for c in CALLS if c["kind"] == "validate"]) == 1)
-    check("생성 3회", len(gen_calls()) == 3, len(gen_calls()))
+    # 3문제를 **한 번의 호출**로 만든다 (QUIZ_BATCH_MAX=3).
+    # 하나씩 병렬로 만들면 서로를 못 봐서 중복이 심하다는 측정 결과에 따른 것이다
+    # (2026-09-08: 같은 주제 3문제 중복 발동률 77%). generator.py 주석 참고.
+    check("3문제를 1회 호출로", len(gen_calls()) == 1, f"{len(gen_calls())}회")
 
-    # 검증 불합격 -> 재생성
+    # 상한을 넘으면 여러 덩어리로 나눠 병렬 호출한다
+    reset(validate={"results": []})
+    qs = asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=5))
+    check("5문제는 2덩어리(3+2)", len(gen_calls()) == 2, f"{len(gen_calls())}회")
+    check("5문제 모두 반환", len(qs) == 5, len(qs))
+
+    # 검증 불합격 -> 그 문제만 단건으로 재생성 (묶음 1회 + 재생성 1회)
     reset(validate={"results": [{"no": 2, "ok": False, "reason": "정답/해설 불일치"}]})
     qs = asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=3))
-    check("불합격 시 재생성", len(gen_calls()) == 4, len(gen_calls()))
+    check("불합격 시 재생성", len(gen_calls()) == 2, f"{len(gen_calls())}회")
     check("개수는 그대로", len(qs) == 3)
 
-    # 근사 중복 -> 재생성
+    # 근사 중복 -> 걸린 문제만 단건 재생성 (묶음 1회 + 재생성 1회)
     reset([_mc("PER이 낮으면 저평가라고 단정할 수 있는가"),
            _mc("PER이 낮으면 저평가라고 단정할 수 있는가"),
            _mc("PER 을 계산할 때 분모로 쓰는 값은 무엇인가"),
            _mc("업종 평균과 비교해야 하는 이유로 옳은 것은")])
     qs = asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2))
-    check("근사 중복 재생성", len(gen_calls()) == 3, len(gen_calls()))
+    check("근사 중복 재생성", len(gen_calls()) == 2, f"{len(gen_calls())}회")
+    check("중복 재생성 후에도 개수 유지", len(qs) == 2, len(qs))
     check("중복 제거됨", qs[0]["question_text"] != qs[1]["question_text"])
 
     # 검증이 깨져도 결과 반환
@@ -430,17 +514,16 @@ def test_angle_rotation():
     # 같은 topic으로 여러 개 -> 관점이 매번 달라야 한다
     reset()
     asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=4))
-    angles = [c["angle"] for c in gen_calls()]
+    angles = all_angles()
     check("배치 4개 관점 모두 다름", len(set(angles)) == 4, len(set(angles)))
     check("관점 순서가 정의 순서대로", angles == Q.GENERATION_ANGLES[:4])
 
-    avoids = [c["avoid_block"] for c in gen_calls()]
-    # 생성이 순차 -> 병렬로 바뀌면서 avoid 계약이 달라졌다.
-    # 동시에 만들면 서로를 볼 수 없으므로 1단계에는 avoid 힌트가 없다.
-    # 순차 생성이 주던 힌트는 실제로 겹친 문제에 한해 2단계에서 복원된다
-    # (test_parallel_dedupe 참고).
-    check("1단계는 avoid 없이 동시 생성",
-          all(a == "(아직 없음)" for a in avoids), avoids)
+    # 묶음 생성으로 바뀌면서 1단계에는 avoid_block 자체가 없다.
+    # 한 번의 호출로 N개를 쓰게 하므로 모델이 서로를 보고 다르게 만든다
+    # (그 근거는 generator.py 의 묶음 생성 주석 참고).
+    check("1단계 호출에는 avoid 개념이 없음",
+          all("avoid_block" not in c for c in gen_calls()),
+          [list(c)[:3] for c in gen_calls()])
 
     # 프롬프트 기반: 주제별로 독립 순환
     plan = {"relevant": True, "count": 5, "items": [
@@ -450,8 +533,8 @@ def test_angle_rotation():
     ]}
     reset(analyze=plan)
     asyncio.run(G.generate_quiz_from_prompt("PER이랑 배당 문제 내줘", USER))
-    per = [c["angle"] for c in gen_calls() if c["topic"] == "PER"]
-    div = [c["angle"] for c in gen_calls() if c["topic"] == "배당"]
+    per = all_angles([c for c in gen_calls() if c["topic"] == "PER"])
+    div = all_angles([c for c in gen_calls() if c["topic"] == "배당"])
     check("PER 3개 관점 다름", len(set(per)) == 3, len(set(per)))
     check("배당 2개 관점 다름", len(set(div)) == 2, len(set(div)))
     check("주제별 독립 순환", per[0] == div[0] == Q.GENERATION_ANGLES[0])
@@ -459,7 +542,7 @@ def test_angle_rotation():
     # 단건 생성은 관점 지정 없이도 동작
     reset()
     asyncio.run(G.generate_quiz(USER, "MULTIPLE_CHOICE", "PER"))
-    check("단건 생성 기본 관점", gen_calls()[0]["angle"] == Q.GENERATION_ANGLES[0])
+    check("단건 생성 기본 관점", angles_of(gen_calls()[0])[0] == Q.GENERATION_ANGLES[0])
 
     # 재요청 시 과거 이력만큼 관점을 밀어야 1차와 안 겹친다
     global BANK_TOPIC_COUNT
@@ -467,7 +550,7 @@ def test_angle_rotation():
     BANK_TOPIC_COUNT = 2
     try:
         asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2))
-        angles = [c["angle"] for c in gen_calls()]
+        angles = all_angles()
         check("과거 이력만큼 관점 시작점 이동",
               angles == Q.GENERATION_ANGLES[2:4], angles == Q.GENERATION_ANGLES[2:4])
     finally:
@@ -479,7 +562,7 @@ def test_angle_rotation():
     try:
         asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=1))
         check("오프셋이 관점 수를 넘으면 순환",
-              gen_calls()[0]["angle"] == Q.GENERATION_ANGLES[0])
+              angles_of(gen_calls()[0])[0] == Q.GENERATION_ANGLES[0])
     finally:
         BANK_TOPIC_COUNT = 0
 
@@ -591,13 +674,15 @@ def test_validation_retraction():
                   "모든 항목이 맞다. 다시 읽어보니 문제가 없으므로 사실 모든 것이 맞다.")
     reset(validate={"results": [{"no": 1, "ok": False, "reason": retracting}]})
     asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2))
-    check("번복된 사유는 재생성 안 함", len(gen_calls()) == 2, len(gen_calls()))
+    # 묶음 1회뿐 - 재생성이 없다는 뜻
+    check("번복된 사유는 재생성 안 함", len(gen_calls()) == 1, f"{len(gen_calls())}회")
 
     # 명확한 사유는 그대로 재생성
     reset(validate={"results": [{"no": 1, "ok": False,
                                  "reason": "오답 3번이 사실이라 정답이 두 개"}]})
     asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2))
-    check("명확한 사유는 재생성", len(gen_calls()) == 3, len(gen_calls()))
+    # 묶음 1회 + 불합격 1건 단건 재생성
+    check("명확한 사유는 재생성", len(gen_calls()) == 2, f"{len(gen_calls())}회")
 
     # 판정 함수 단위
     for text, expect in [
@@ -632,7 +717,8 @@ def test_bank_integration():
     SETTINGS.QUIZ_DUP_CHECK_PAST = True
     try:
         asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2))
-        check("과거 중복 감지 시 재생성", len(gen_calls()) == 4, len(gen_calls()))
+        # 묶음 1회 + 2문제가 모두 과거와 중복이라 단건 재생성 2회
+        check("과거 중복 감지 시 재생성", len(gen_calls()) == 3, f"{len(gen_calls())}회")
     finally:
         BANK_SIMILARITY = None
         SETTINGS.QUIZ_DUP_CHECK_PAST = False
@@ -641,7 +727,7 @@ def test_bank_integration():
     reset()
     BANK_UPSERTS.clear()
     asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2))
-    check("중복 없으면 재생성 없음", len(gen_calls()) == 2, len(gen_calls()))
+    check("중복 없으면 재생성 없음", len(gen_calls()) == 1, f"{len(gen_calls())}회 (묶음 1회)")
     check("확정본이 뱅크에 저장됨", len(BANK_UPSERTS) == 1, len(BANK_UPSERTS))
     check("저장 개수 = 문제 개수",
           len(BANK_UPSERTS[0]["points"]) == 2, len(BANK_UPSERTS[0]["points"]))
@@ -805,26 +891,30 @@ def test_parallel_dedupe():
     calls = gen_calls()
     check("중복분이 재생성됨", len(calls) > 3, f"{len(calls)}회 (1단계 3 + 재생성)")
 
-    first_pass, retries = calls[:3], calls[3:]
-    check("1단계는 avoid 없음",
-          all(c["avoid_block"] == "(아직 없음)" for c in first_pass),
-          [c["avoid_block"] for c in first_pass])
+    # 1단계는 묶음 1회, 그 뒤가 전부 단건 재생성이다
+    first_pass, retries = calls[:1], calls[1:]
+    check("1단계는 묶음 1회", len(first_pass) == 1 and "slot_block" in first_pass[0],
+          list(first_pass[0])[:4])
     # 거부된 자기 자신을 avoid 에 넣지 않으면 모델이 방금 만든 것을 그대로
     # 다시 내놓는다 (실측 유사도 1.000). 재생성 호출에는 반드시 채워져야 한다.
     check("재생성에는 avoid 가 채워짐",
-          bool(retries) and all(c["avoid_block"] != "(아직 없음)" for c in retries),
-          [c["avoid_block"] for c in retries])
+          bool(retries) and all(c.get("avoid_block", "(아직 없음)") != "(아직 없음)"
+                                for c in retries),
+          [c.get("avoid_block") for c in retries])
     # 같은 관점으로 다시 만들면 같은 문제가 또 나온다(실측 유사도 0.979) - 관점을 민다.
-    # 세트 전체와 겹치지 않게 할 수는 없다: 관점은 5주기라 count 만큼 밀면 결국 순환한다.
-    # 요구되는 것은 "그 문제가 방금 쓴 관점"을 다시 쓰지 않는 것이다.
-    check("재생성은 자기 1단계와 다른 관점",
-          all(r["angle"] != f["angle"] for r, f in zip(retries, first_pass)),
-          [(f["angle"][:12], r["angle"][:12]) for f, r in zip(first_pass, retries)])
+    # 관점은 5주기라 count 만큼 밀면 결국 순환한다. 세트 전체와 겹치지 않게 할
+    # 수는 없고, 요구되는 것은 "그 문제가 방금 쓴 관점"을 다시 쓰지 않는 것이다.
+    batch_angles = angles_of(first_pass[0])
+    check("재생성은 자기 슬롯의 1단계 관점과 다름",
+          all(angles_of(r)[0] != batch_angles[i]
+              for i, r in enumerate(retries) if i < len(batch_angles)),
+          [(batch_angles[i][:12], angles_of(r)[0][:12])
+           for i, r in enumerate(retries) if i < len(batch_angles)])
 
     # 중복이 없으면 재생성이 한 번도 일어나지 않아야 한다 (불필요한 LLM 호출 금지)
     reset()
     asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=3))
-    check("중복 없으면 재생성 없음", len(gen_calls()) == 3, len(gen_calls()))
+    check("중복 없으면 재생성 없음", len(gen_calls()) == 1, f"{len(gen_calls())}회 (묶음 1회)")
 
 
 # =========================================================
@@ -844,7 +934,7 @@ def test_dup_scope():
         SETTINGS.QUIZ_DUP_CHECK_PAST = False
         asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=3))
         off_calls = len(gen_calls())
-        check("꺼짐: 과거와 겹쳐도 재생성 없음", off_calls == 3, f"{off_calls}회")
+        check("꺼짐: 과거와 겹쳐도 재생성 없음", off_calls == 1, f"{off_calls}회 (묶음 1회)")
 
         reset()
         SETTINGS.QUIZ_DUP_CHECK_PAST = True
@@ -861,7 +951,58 @@ def test_dup_scope():
     reset([_mc(same), _mc(same), _mc(same)])
     asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=3))
     texts = [q for q in gen_calls()]
-    check("꺼져 있어도 세트 내 중복은 재생성", len(texts) > 3, f"{len(texts)}회")
+    check("꺼져 있어도 세트 내 중복은 재생성", len(texts) > 1, f"{len(texts)}회")
+
+# =========================================================
+# 16. 검증 모드 (QUIZ_VALIDATE_MODE)
+# =========================================================
+
+def test_validate_mode():
+    """blocking / background / off 가 각각 다르게 동작하는지 본다."""
+    print("\n--- 검증 모드 ---")
+    import app.services.quiz.concurrency as C
+
+    def validate_calls():
+        return len([c for c in CALLS if c["kind"] == "validate"])
+
+    # 불합격 1건이 나오는 상황을 만들어 둔다
+    bad = {"results": [{"no": 1, "ok": False, "reason": "정답과 해설이 모순"}]}
+
+    # blocking: 검증하고 재생성까지 한다
+    reset(validate=bad)
+    SETTINGS.QUIZ_VALIDATE_MODE = "blocking"
+    asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2))
+    check("blocking: 검증 호출됨", validate_calls() == 1, validate_calls())
+    check("blocking: 불합격분 재생성", len(gen_calls()) == 2,
+          f"{len(gen_calls())}회 (묶음 1 + 재생성 1)")
+
+    # off: 검증 자체를 안 한다
+    reset(validate=bad)
+    SETTINGS.QUIZ_VALIDATE_MODE = "off"
+    asyncio.run(G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2))
+    check("off: 검증 호출 없음", validate_calls() == 0, validate_calls())
+    check("off: 재생성 없음", len(gen_calls()) == 1, f"{len(gen_calls())}회 (묶음 1회)")
+
+    # background: 응답을 막지 않는다 (재생성 없음). 검증은 뒤에서 돈다.
+    async def run_background():
+        reset(validate=bad)
+        SETTINGS.QUIZ_VALIDATE_MODE = "background"
+        qs = await G.generate_quiz_batch(USER, "MULTIPLE_CHOICE", "PER", count=2)
+        # 응답 시점에는 재생성이 없어야 한다
+        during = len(gen_calls())
+        # 뒤에 뜬 태스크가 끝날 때까지 잠깐 양보한다
+        for _ in range(50):
+            if not C._background:
+                break
+            await asyncio.sleep(0.01)
+        return qs, during
+
+    qs, during = asyncio.run(run_background())
+    SETTINGS.QUIZ_VALIDATE_MODE = "blocking"
+    check("background: 문제 개수 유지", len(qs) == 2, len(qs))
+    check("background: 응답 시점에 재생성 없음", during == 1, f"{during}회 (묶음 1회)")
+    check("background: 검증은 뒤에서 실행됨", validate_calls() == 1, validate_calls())
+    check("background: 태스크 참조가 정리됨", len(C._background) == 0, len(C._background))
 
 
 if __name__ == "__main__":
@@ -880,6 +1021,7 @@ if __name__ == "__main__":
     test_answer_position()
     test_parallel_dedupe()
     test_dup_scope()
+    test_validate_mode()
 
     print("\n" + "=" * 55)
     if FAILURES:

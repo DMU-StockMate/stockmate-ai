@@ -36,9 +36,15 @@ logger = setup_logger(__name__)
 # LLM 헬퍼
 # =========================================================
 
-def get_llm():
-    """퀴즈 생성용 LLM (temperature 0.7 - 문제 다양성을 위해 높게)."""
-    return build_llm(temperature=0.7)
+def get_llm(reasoning_effort: str | None = None, max_tokens: int | None = None):
+    """퀴즈 생성용 LLM (temperature 0.7 - 문제 다양성을 위해 높게).
+
+    reasoning_effort 를 주면 그 호출만 사고 강도를 덮어쓴다. 문제 생성은
+    medium 을 유지해야 하지만(용어 정확도), 프롬프트 분석 같은 추출 작업은
+    낮춰도 되기 때문이다 (config.ANALYZE_REASONING_EFFORT).
+    """
+    return build_llm(temperature=0.7, reasoning_effort=reasoning_effort,
+                     max_tokens=max_tokens)
 
 def extract_json(text: str) -> dict:
     """LLM 응답에서 JSON 추출.
@@ -171,8 +177,7 @@ ANGLE_BLOCK = """
 {angle}
 
 - 위 지시를 반드시 따르세요. 이 방향에서 벗어난 문제는 만들지 마세요.
-- 같은 주제의 다른 방향 문제들은 이미 출제되었습니다.
-  위에 적힌 방향 하나만 다루세요.
+- 위에 적힌 방향 하나만 다루세요.
 
 [이번 세트에서 이미 출제된 문제]
 {avoid_block}

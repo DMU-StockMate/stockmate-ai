@@ -14,6 +14,7 @@ from app.services.quiz.categories import (
     get_problem_direction,
 )
 from app.services.quiz.concurrency import (
+    fire_and_forget,
     generate_all,
     regenerate_failed,
     resolve_duplicates,
@@ -40,6 +41,17 @@ _get_llm = get_llm
 _extract_json = extract_json
 
 logger = setup_logger(__name__)
+
+
+def _analyze_llm():
+    """프롬프트 분석·카테고리 매핑용 LLM.
+
+    문제 생성과 사고 강도를 분리한다. 생성은 용어를 정확히 인출해야 해서
+    medium 이 필요하지만(모델 선정 문서 참고), 분석은 "프롬프트에서 주제·개수·
+    유형을 뽑아 카탈로그 코드에 맞추는" 구조화 추출이라 사고가 덜 필요하다.
+    계측상 분석 한 번이 19.8초로 전체의 24% 였다.
+    """
+    return get_llm(reasoning_effort=settings.ANALYZE_REASONING_EFFORT or None)
 
 
 class PromptTopicError(ValueError):
@@ -217,6 +229,222 @@ JSON 형식:
   "topic": "{topic}"
 }}
 """)
+
+
+# =========================================================
+# 한 번의 호출로 여러 문제 생성 (중복 대책)
+# =========================================================
+#
+# 왜 만들었나 - 2026-09-08 측정 (n=30씩, 같은 주제 3문제):
+#
+#   중복 발동률 77%.  30세트 중 11건은 유사도 0.95 이상(거의 글자까지 동일).
+#
+# 문제를 하나씩 병렬로 만들면 서로의 결과를 볼 수 없어서, 모델이 같은 주제에
+# 대해 각자 가장 자연스러운 첫 문장("X에 대한 설명으로 옳은 것은?")을 쓴다.
+# 관점(angle)을 다르게 줘도, "다른 문제가 어느 방향을 맡았는지" 알려줘도
+# 바뀌지 않았다 (형제 관점 힌트 실험: 23/30 -> 22/30, 기각).
+#
+# 부탁으로 될 일이 아니라서 구조를 바꿨다. **한 번의 호출로 N개를 쓰게 하면**
+# 모델이 N개를 나란히 놓고 쓰므로 스스로 다르게 만든다. 덤으로 LLM 호출이
+# N번 -> 1번이 되고, 2,900자짜리 프롬프트를 N번 보내던 것도 1번이 된다.
+#
+# 안전장치: 출력 토큰이 개수에 비례해 늘어나므로 한 번에 만들 수를 제한한다
+# (settings.QUIZ_BATCH_MAX). 그보다 많으면 여러 덩어리로 나눠 병렬 호출한다.
+
+MC_BATCH_PROMPT = ChatPromptTemplate.from_template("""
+당신은 주식 투자 교육 전문가입니다.
+아래 조건에 맞는 4지선다 객관식 문제를 **정확히 {count}개** 생성하세요.
+
+조건:
+- 주제: {topic}{topic_hint}
+  이 주제의 범위를 벗어나지 마세요. 다른 지표나 개념을 주인공으로 삼으면 안 됩니다.
+{direction_block}- 난이도: {level} ({level_guide})
+
+[이 난이도에서 문제를 만드는 방식]
+{level_style}
+
+""" + QUALITY_RULES + """
+""" + MC_QUALITY_RULES + """
+- 해설은 정답이 왜 맞고 오답이 왜 틀린지 설명하세요.
+
+=========================================
+가장 중요한 지시 — 문제별 출제 방향과 정답 위치
+=========================================
+{slot_block}
+
+- 각 문제는 **배정된 방향 하나만** 다루세요.
+- **{count}개 문제는 서로 확실히 달라야 합니다.** 표현만 바꿔서 같은 것을 묻는 것도
+  중복입니다. 특히 여러 문제를 "{topic}에 대한 설명으로 옳은 것은?" 같은 같은
+  형태로 시작하지 마세요. 문제를 쓰기 전에 {count}개가 서로 무엇이 다른지 정하세요.
+- **correct_no 는 위에 지정된 번호를 그대로 쓰세요.**
+
+JSON 형식 (questions 배열의 길이는 반드시 {count}):
+{{
+  "questions": [
+    {{
+      "question_text": "문제 내용 (한 문장)",
+      "choices": [
+        {{"no": 1, "text": "선택지1"}},
+        {{"no": 2, "text": "선택지2"}},
+        {{"no": 3, "text": "선택지3"}},
+        {{"no": 4, "text": "선택지4"}}
+      ],
+      "correct_no": 지정된 정답 번호,
+      "explanation": "해설 내용 (2~3문장)",
+      "topic": "{topic}"
+    }}
+  ]
+}}
+""")
+
+OX_BATCH_PROMPT = ChatPromptTemplate.from_template("""
+당신은 주식 투자 교육 전문가입니다.
+아래 조건에 맞는 OX 문제를 **정확히 {count}개** 생성하세요.
+
+조건:
+- 주제: {topic}{topic_hint}
+  이 주제의 범위를 벗어나지 마세요. 다른 지표나 개념을 주인공으로 삼으면 안 됩니다.
+{direction_block}- 난이도: {level} ({level_guide})
+
+[이 난이도에서 문제를 만드는 방식]
+{level_style}
+
+""" + QUALITY_RULES + """
+""" + OX_QUALITY_RULES + """
+- 해설은 왜 그 답이 맞는지 설명하세요.
+
+=========================================
+가장 중요한 지시 — 문제별 출제 방향
+=========================================
+{slot_block}
+
+- 각 문제는 **배정된 방향 하나만** 다루세요.
+- **{count}개 문제는 서로 확실히 달라야 합니다.** 표현만 바꿔서 같은 것을 묻는 것도
+  중복입니다. 문제를 쓰기 전에 {count}개가 서로 무엇이 다른지 정하세요.
+- 정답이 전부 O 이거나 전부 X 가 되지 않게 섞으세요.
+
+JSON 형식 (questions 배열의 길이는 반드시 {count}):
+{{
+  "questions": [
+    {{
+      "question_text": "문제 내용",
+      "answer": "O" 또는 "X",
+      "explanation": "해설 내용 (2~3문장)",
+      "topic": "{topic}"
+    }}
+  ]
+}}
+""")
+
+
+def _format_slot_block(slots: list[dict], quiz_type: str) -> str:
+    """문제별 출제 방향(과 정답 위치)을 프롬프트 조각으로 만든다."""
+    lines = []
+    for i, slot in enumerate(slots, 1):
+        lines.append(f"[{i}번 문제]")
+        lines.append(slot["angle"])
+        if quiz_type == "MULTIPLE_CHOICE":
+            lines.append(f"→ 이 문제의 정답은 반드시 {slot['answer_pos']}번 자리에 두세요.")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+async def generate_quiz_chunk(
+    user: UserContext, quiz_type: str, topic: str, slots: list[dict],
+    topic_desc: str = "", direction: str = "",
+) -> list[dict]:
+    """한 번의 LLM 호출로 slots 개수만큼 문제를 만든다.
+
+    slots: [{"angle": ..., "answer_pos": ...}, ...]
+
+    개수가 맞지 않거나 한 문제라도 결정론적 검사에 걸리면 **세트 전체를**
+    다시 만든다(최대 3회). 개별 재시도보다 비싸 보이지만, 한 번에 쓰게 하는
+    것이 중복을 없애는 방법이라 그 대가를 받아들인다.
+    """
+    count = len(slots)
+    level_guide = LEVEL_GUIDE.get(user.investment_level, LEVEL_GUIDE["미설정"])
+    prompt = OX_BATCH_PROMPT if quiz_type == "OX" else MC_BATCH_PROMPT
+
+    # 출력 예산은 문제 수에 비례해야 한다. 기본값(1문항 기준)으로 3문항을
+    # 만들게 하면 JSON 이 중간에 잘리고 재시도 3회를 소진한다 (실측).
+    # 사고 토큰은 호출당 한 번이므로 기본값을 두고 (count-1) 만큼만 더한다.
+    base = settings.LLM_MAX_TOKENS or 4096
+    budget = base + (count - 1) * settings.QUIZ_BATCH_TOKENS_PER_ITEM
+    chain = prompt | get_llm(max_tokens=budget)
+
+    prompt_vars = {
+        "count": count,
+        "topic": topic,
+        "level": user.investment_level,
+        "level_guide": level_guide,
+        "level_style": level_style_for(user.investment_level),
+        "topic_hint": f" ({topic_desc})" if topic_desc else "",
+        "direction_block": format_direction_block(direction),
+        "slot_block": _format_slot_block(slots, quiz_type),
+    }
+
+    for attempt in range(3):
+        try:
+            response = await chain.ainvoke(prompt_vars)
+            data = _extract_json(response.content)
+            items = data.get("questions")
+            if not isinstance(items, list):
+                raise ValueError("questions 배열이 없음")
+            if len(items) != count:
+                raise ValueError(f"문제 수 불일치: {len(items)}개 (요구 {count}개)")
+
+            results = []
+            for item, slot in zip(items, slots):
+                if quiz_type == "OX":
+                    check_ox_question(item, topic=topic, topic_desc=topic_desc)
+                    results.append({
+                        "question_type": "OX",
+                        "question_text": item["question_text"],
+                        "choices": [
+                            {"choice_no": 1, "text": "O", "is_correct": item["answer"] == "O"},
+                            {"choice_no": 2, "text": "X", "is_correct": item["answer"] == "X"},
+                        ],
+                        "explanation": item["explanation"],
+                        "topic": item.get("topic", topic),
+                        "level": user.investment_level,
+                    })
+                else:
+                    check_mc_question(item, topic=topic, topic_desc=topic_desc,
+                                      answer_pos=slot["answer_pos"])
+                    results.append({
+                        "question_type": "MULTIPLE_CHOICE",
+                        "question_text": item["question_text"],
+                        "choices": [
+                            {"choice_no": c["no"], "text": c["text"],
+                             "is_correct": c["no"] == item["correct_no"]}
+                            for c in item["choices"]
+                        ],
+                        "explanation": item["explanation"],
+                        "topic": item.get("topic", topic),
+                        "level": user.investment_level,
+                    })
+            return results
+        except Exception as e:
+            logger.warning(
+                f"묶음 생성 시도 {attempt + 1}/3 실패 "
+                f"(topic={topic}, {quiz_type}, {count}개): {type(e).__name__}: {e}"
+            )
+            if attempt == 2:
+                logger.error(f"묶음 생성 3회 소진 (topic={topic}, {count}개): {e}")
+                raise ValueError(f"묶음 문제 생성 실패: {e}")
+
+    raise ValueError("묶음 문제 생성 실패")
+
+
+def chunk_slots(slots: list[dict], size: int) -> list[list[dict]]:
+    """슬롯을 한 번에 만들 수 있는 크기로 나눈다.
+
+    출력 토큰이 개수에 비례하므로 무한정 키울 수 없다. 나뉜 덩어리끼리는
+    서로를 못 보므로 중복 가능성이 남지만, resolve_duplicates 가 그대로
+    안전망 역할을 한다.
+    """
+    size = max(1, size)
+    return [slots[i:i + size] for i in range(0, len(slots), size)]
 
 
 def _get_random_topic(quiz_type: str) -> str:
@@ -415,24 +643,30 @@ async def generate_quiz_batch(
         (angle_for(offset + i), answer_pos_for(offset + i + answer_pos_offset(topic)))
         for i in range(count)
     ]
+    # 1단계는 **묶음 호출**이다. 한 번에 여러 문제를 쓰게 해야 모델이 서로를
+    # 보고 다르게 만든다 (하나씩 병렬로 만들면 중복 발동률 77% - 위 주석 참고).
+    # QUIZ_BATCH_MAX 를 넘으면 여러 덩어리로 나눠 병렬 호출한다.
+    slots = [{"angle": a, "answer_pos": p} for a, p in plan]
+    chunks = chunk_slots(slots, settings.QUIZ_BATCH_MAX)
 
-    def make(i: int, avoid: list[str], angle: str = ""):
-        _angle, answer_pos = plan[i]
-
-        async def _make() -> dict:
-            return await generate_quiz(
-                user, quiz_type, topic, angle or _angle, avoid, topic_desc,
-                answer_pos, direction)
-
+    def chunk_maker(chunk: list[dict]):
+        async def _make() -> list[dict]:
+            return await generate_quiz_chunk(
+                user, quiz_type, topic, chunk, topic_desc, direction)
         return _make
 
-    questions = await generate_all([make(i, []) for i in range(count)])
+    grouped = await generate_all([chunk_maker(c) for c in chunks])
+    questions = [q for group in grouped for q in group]
 
     # 1단계에는 avoid 힌트가 없었으므로 겹친 것만 골라 다시 만든다.
     # 같은 관점으로 다시 만들면 같은 문제가 또 나온다(실측: ROE 5문제에서 서로 다른
     # 관점인데도 유사도 0.979). 재시도는 세트 밖 관점으로 민다.
     async def retry_dup(i: int, avoid: list[str]) -> dict:
-        return await make(i, avoid, angle_for(offset + i + count))()
+        # 재생성은 단건 경로를 쓴다. 걸린 문제 하나만 다시 만들면 되고,
+        # 이때는 avoid 에 나머지 본문이 채워져 있어 단건으로도 충분히 갈린다.
+        return await generate_quiz(
+            user, quiz_type, topic, angle_for(offset + i + count), avoid,
+            topic_desc, plan[i][1], direction)
 
     await resolve_duplicates(questions, retry_dup, user)
 
@@ -461,6 +695,14 @@ async def _revalidate_and_fix(
     (예전에는 불합격 건을 순차로 재생성해, 3건이 걸리면 3번을 직렬로 더 기다렸다.)
     재생성본은 다시 검증하지 않는다 - 검증 호출이 계속 늘어나는 것을 막기 위한 타협.
     """
+    mode = (settings.QUIZ_VALIDATE_MODE or "blocking").strip().lower()
+    if mode == "off":
+        return
+    if mode == "background":
+        # 응답을 막지 않는다. 계측상 이 단계가 프롬프트 퀴즈 지연의 30% 였다.
+        fire_and_forget(report_validation(list(questions), "quiz"), "사후 검증")
+        return
+
     failed = await validate_questions(questions)
 
     if not failed:
@@ -475,6 +717,24 @@ async def _revalidate_and_fix(
             user, quiz_type, topic, angle, avoid, topic_desc, answer_pos, direction)
 
     await regenerate_failed(questions, failed, retry_failed)
+
+
+async def report_validation(questions: list[dict], label: str) -> None:
+    """검사만 하고 결과를 로그로 남긴다 (background / 재생성 없음).
+
+    응답은 이미 나갔으므로 고칠 수 없다. 목적은 "요즘도 걸리는 게 있는가"를
+    계속 관찰하는 것이다. 며칠 로그를 보고 blocking 으로 되돌릴지, off 로
+    완전히 뺄지 정하면 된다.
+    """
+    failed = await validate_questions(questions)
+    if not failed:
+        logger.info(f"[{label}] 사후 검증 통과 (전체 합격)")
+        return
+    for idx, reason in failed.items():
+        logger.warning(
+            f"[{label}] 사후 검증 불합격 {idx + 1}번: {reason} "
+            f"| 문제: {questions[idx].get('question_text', '')[:60]}"
+        )
 
 
 # =========================================================
@@ -679,7 +939,7 @@ def _validate_plan_item(item: dict, categories: list[QuizCategoryIn]) -> dict | 
 
 async def _analyze_once(prompt: str, categories: list[QuizCategoryIn]) -> list[dict]:
     """주어진 카탈로그로 분석 1회 실행 → 검증된 출제 계획 반환."""
-    chain = ANALYZE_PROMPT | _get_llm()
+    chain = ANALYZE_PROMPT | _analyze_llm()
     catalog = _format_catalog(categories)
 
     data = None
@@ -730,7 +990,7 @@ async def _map_topics_to_catalog(
     실패해도 예외를 던지지 않고 빈 dict를 반환한다 — 매핑은 부가 정보라
     실패했다고 문제 생성 전체를 막을 이유가 없다 (category_code=null 허용).
     """
-    chain = MAP_TOPICS_PROMPT | _get_llm()
+    chain = MAP_TOPICS_PROMPT | _analyze_llm()
     data = None
     for attempt in range(3):
         try:
@@ -857,22 +1117,49 @@ async def generate_quiz_from_prompt(prompt: str, user: UserContext) -> list[dict
             "primary_detail_code": primary_detail,
         })
 
-    def make(i: int, avoid: list[str], angle: str = ""):
-        spec = specs[i]
+    # 같은 (주제, 유형)끼리 묶어 한 번의 호출로 만든다. 중복은 같은 주제 안에서만
+    # 생기므로 묶는 단위도 그것이다. 주제가 다르면 애초에 겹치지 않는다.
+    groups: dict[tuple, list[int]] = {}
+    for i, spec in enumerate(specs):
+        groups.setdefault((spec["topic"], spec["quiz_type"]), []).append(i)
 
-        async def _make() -> dict:
-            return await generate_quiz(
-                user, spec["quiz_type"], spec["topic"], angle or spec["angle"],
-                avoid, spec["topic_desc"], spec["answer_pos"], spec["direction"])
+    jobs, job_indexes = [], []
+    for (topic, quiz_type), idxs in groups.items():
+        base = specs[idxs[0]]
+        for chunk in chunk_slots(
+            [{"angle": specs[i]["angle"], "answer_pos": specs[i]["answer_pos"]}
+             for i in idxs],
+            settings.QUIZ_BATCH_MAX,
+        ):
+            n = len(chunk)
+            take, idxs = idxs[:n], idxs[n:]
+            job_indexes.append(take)
 
-        return _make
+            def maker(topic=topic, quiz_type=quiz_type, chunk=chunk, base=base):
+                async def _make() -> list[dict]:
+                    return await generate_quiz_chunk(
+                        user, quiz_type, topic, chunk,
+                        base["topic_desc"], base["direction"])
+                return _make
+            jobs.append(maker())
 
-    questions = await generate_all([make(i, []) for i in range(len(specs))])
+    grouped = await generate_all(jobs)
+
+    # 원래 순서대로 되돌린다 (정답 위치·카테고리 매핑이 인덱스에 묶여 있다)
+    questions: list[dict] = [None] * len(specs)
+    for idxs, group in zip(job_indexes, grouped):
+        for i, q in zip(idxs, group):
+            questions[i] = q
 
     # 1단계에는 avoid 힌트가 없었으므로 겹친 것만 골라 다시 만든다.
     # 재시도는 세트 밖 관점으로 민다 - 같은 관점이면 같은 문제가 또 나온다.
     async def retry_dup(i: int, avoid: list[str]) -> dict:
-        return await make(i, avoid, angle_for(topic_slot[specs[i]["topic"]] + i))()
+        # 재생성은 단건 경로 (걸린 하나만, avoid 가 채워진 상태로)
+        spec = specs[i]
+        return await generate_quiz(
+            user, spec["quiz_type"], spec["topic"],
+            angle_for(topic_slot[spec["topic"]] + i), avoid,
+            spec["topic_desc"], spec["answer_pos"], spec["direction"])
 
     await resolve_duplicates(questions, retry_dup, user)
 

@@ -193,6 +193,38 @@ async def resolve_duplicates(
     return questions
 
 
+# 백그라운드 태스크의 강한 참조. 이걸 안 잡으면 asyncio 가 실행 중인 태스크를
+# 가비지 컬렉션해서 조용히 사라진다 (파이썬 공식 문서가 경고하는 함정).
+_background: set = set()
+
+
+def fire_and_forget(coro, label: str = "background") -> None:
+    """응답을 막지 않고 뒤에서 돌린다. 실패해도 요청에 영향을 주지 않는다.
+
+    실행 중인 이벤트 루프가 없으면(동기 컨텍스트) 조용히 버린다 - 부가 작업이라
+    이것 때문에 호출부가 실패하면 안 된다.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning(f"{label}: 실행 중인 이벤트 루프가 없어 건너뜀")
+        coro.close()
+        return
+
+    task = loop.create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+    def _report(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.warning(f"{label} 실패 - 무시하고 진행: {exc}")
+
+    task.add_done_callback(_report)
+
+
 async def regenerate_failed(
     questions: list[dict],
     failed: dict[int, str],
