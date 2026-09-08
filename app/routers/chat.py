@@ -12,6 +12,7 @@ from app.services.rag.chain import (
 )
 from app.services.rag.ticker_extractor import extract_tickers, extract_tickers_from_history
 from app.core.logger import setup_logger
+from app.core.keepalive import json_with_keepalive
 
 # /chat/evaluate 의 예외 핸들러가 logger 를 쓰는데 정의가 없어
 # 에러 발생 시 NameError 로 원래 예외가 가려지고 있었다.
@@ -303,6 +304,10 @@ async def ask(req: AskRequest):
 """,
 )
 async def chat_evaluate(req: ChatStreamRequest):
+    return await json_with_keepalive(_chat_evaluate(req), label="/chat/evaluate")
+
+
+async def _chat_evaluate(req: ChatStreamRequest):
     # 디버그 엔드포인트라 전역 500 핸들러가 에러를 가리지 않도록 여기서 잡아
     # 실제 예외 메시지와 traceback을 그대로 반환한다(원인 파악용).
     try:

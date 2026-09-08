@@ -10,6 +10,7 @@ from app.services.quiz.generator import (
 from app.services.quiz.review import (
     generate_quiz_from_wrong_answers, NoWrongAnswerError, REVIEW_QUIZ_COUNT,
 )
+from app.core.keepalive import json_with_keepalive
 
 router = APIRouter(prefix="/quiz", tags=["quiz"])
 
@@ -100,7 +101,7 @@ OX 문제 (quiz_type: "OX")
     }
 )
 async def generate(req: QuizGenerateRequest):
-    try:
+    async def build():
         results = await generate_quiz_batch(
             user=req.user,
             quiz_type=req.quiz_type,
@@ -108,6 +109,9 @@ async def generate(req: QuizGenerateRequest):
             count=req.count,
         )
         return QuizGenerateBatchResponse(questions=[QuizGenerateResponse(**r) for r in results])
+
+    try:
+        return await json_with_keepalive(build(), label="/quiz/generate")
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -233,7 +237,7 @@ RunPod HTTP 프록시(Cloudflare)는 **100초에서 524로 끊습니다**(2026-0
     },
 )
 async def generate_from_prompt(req: PromptQuizGenerateRequest):
-    try:
+    async def build():
         results = await generate_quiz_from_prompt(
             prompt=req.prompt,
             user=req.user,
@@ -242,6 +246,9 @@ async def generate_from_prompt(req: PromptQuizGenerateRequest):
             prompt=req.prompt,
             questions=[PromptQuizQuestion(**r) for r in results],
         )
+
+    try:
+        return await json_with_keepalive(build(), label="/quiz/generate/prompt")
     except PromptTopicError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except ValueError as e:
@@ -347,7 +354,7 @@ async def generate_from_prompt(req: PromptQuizGenerateRequest):
     },
 )
 async def generate_from_wrong_answers(req: ReviewQuizGenerateRequest):
-    try:
+    async def build():
         results = await generate_quiz_from_wrong_answers(
             user=req.user,
             wrong_answers=req.wrong_answers,
@@ -355,6 +362,9 @@ async def generate_from_wrong_answers(req: ReviewQuizGenerateRequest):
         return ReviewQuizGenerateResponse(
             questions=[PromptQuizQuestion(**r) for r in results],
         )
+
+    try:
+        return await json_with_keepalive(build(), label="/quiz/generate/review")
     except NoWrongAnswerError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except ValueError as e:

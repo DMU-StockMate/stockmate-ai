@@ -152,6 +152,28 @@ class Settings(BaseSettings):
     # 빈 문자열이면 LLM_REASONING_EFFORT 를 그대로 쓴다.
     ANALYZE_REASONING_EFFORT: str = "none"
 
+    # ── 하트비트 응답 (Cloudflare 100초 벽 우회) ──
+    #
+    # RunPod HTTP 프록시는 **응답 첫 바이트까지 100초**를 기다린 뒤 524 로 끊는다.
+    # 켜 두면 오래 걸리는 응답에 공백을 주기적으로 흘려보내 그 벽을 없앤다.
+    # JSON 값 앞의 공백은 문법상 무시되므로 백엔드 코드는 그대로 둬도 된다.
+    # 자세한 배경과 상태 코드 제약은 app/core/keepalive.py 문서 참고.
+    #
+    # 끄고 싶어질 상황: 중간 프록시가 application/json 을 버퍼링해 하트비트가
+    # 소용없거나, 오히려 문제를 만들 때. 그때 이미지 재빌드 없이 템플릿 env 로
+    # 되돌릴 수 있어야 해서 설정으로 뺐다.
+    RESPONSE_KEEPALIVE_ENABLED: bool = True
+    # 첫 박동까지의 대기. 이 시간 안에 끝나면 응답은 예전과 완전히 동일하고,
+    # 예외도 정상적인 422/500 상태 코드로 나간다.
+    #
+    # 30초인 이유: 실제로 잡히는 예외(PromptTopicError = 주제 판별 실패)는
+    # 분석 단계에서 나므로 약 4초면 결정된다. 30초면 그 여유를 충분히 벌면서
+    # 100초 벽까지 70초를 남긴다. 첫 박동이 늦을수록 상태 코드가 살고,
+    # 이를수록 벽에서 멀어지는 맞교환이다.
+    RESPONSE_KEEPALIVE_DELAY_SEC: float = 30.0
+    # 박동 간격. Cloudflare 의 무응답 허용치보다 넉넉히 짧아야 한다.
+    RESPONSE_KEEPALIVE_INTERVAL_SEC: float = 10.0
+
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
     # 임베딩 실행 장치. 로컬(4060 Ti 8GB)은 VRAM 을 LLM 이 다 쓰므로 cpu,
     # 서버(H100)는 vLLM 이 0.88 만 잡고 남는 자리에 올릴 수 있어 cuda.
