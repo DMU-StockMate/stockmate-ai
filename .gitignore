@@ -19,3 +19,7 @@ finetune/
 *.bak
 compare_out/
 *_coverage_report.txt
+
+# 세션 중 만드는 임시 산출물 (측정 로그, 일회성 스크립트, 서버 로그).
+# 접두사 _ 로 통일해 두면 작업 중 git status 가 깨끗하게 유지된다.
+_*
