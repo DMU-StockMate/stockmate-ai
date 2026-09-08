@@ -28,9 +28,10 @@ KV 캐시 여유가 16k 기준 49개이므로 100건이면 vLLM 이 큐잉한다
 ## 합격선 (베타 기준)
 
 - 성공 20/20, HTTP 5xx·타임아웃 0
-- **최대 지연 100초 미만** — RunPod HTTP 프록시(Cloudflare) 한계가 아직
-  검증되지 않았다. 런북 8-2 는 "제한 없음"으로 기록했지만 근거가 count=4 의
-  98.9초 성공이라, 100 초를 넘겨서 통과한 게 아니라 안 넘겨서 통과한 것이다.
+- **HTTP 524 가 0건** — 프록시(Cloudflare)의 100초 제한은 실재한다(2026-09-05
+  재현). 하트비트 응답으로 이 벽은 없앴고 파드에서 140초 요청 통과를 확인했다
+  (2026-09-08). 524 가 다시 보이면 하트비트가 꺼졌거나 안 먹은 것이다.
+- **최대 지연 100초 미만이면 좋다** — 이제는 실패선이 아니라 체감 기준이다.
 - NestJS 는 타임아웃을 180초 이상으로 잡을 것 (런북 8-3).
 """
 import argparse
@@ -96,6 +97,7 @@ def _payload(i: int) -> tuple[str, dict]:
 
 async def _one(client, i: int) -> dict:
     path, body = _payload(i)
+    topic = TOPICS[i % len(TOPICS)]
     headers = {"X-API-Key": A.api_key} if A.api_key else {}
     started = time.perf_counter()
     try:
@@ -104,12 +106,19 @@ async def _one(client, i: int) -> dict:
         if r.status_code != 200:
             # 본문을 잘라 남긴다 - 500 의 detail 이 원인 파악의 전부다
             return {"ok": False, "elapsed": elapsed, "status": r.status_code,
-                    "error": r.text[:160]}
-        n = len((r.json() or {}).get("questions") or [])
-        return {"ok": True, "elapsed": elapsed, "status": 200, "questions": n}
+                    "topic": topic, "error": r.text[:160]}
+        payload = r.json() or {}
+        # 하트비트 응답은 상태 코드를 못 바꾸므로 200 이어도 실패일 수 있다.
+        # questions 가 없으면 실패다 (app/core/keepalive.py 참고).
+        if payload.get("keepalive_error") or "questions" not in payload:
+            return {"ok": False, "elapsed": elapsed, "status": 200, "topic": topic,
+                    "error": "keepalive_error: " + str(payload.get("detail"))[:120]}
+        n = len(payload.get("questions") or [])
+        return {"ok": True, "elapsed": elapsed, "status": 200,
+                "topic": topic, "questions": n}
     except Exception as e:
         return {"ok": False, "elapsed": time.perf_counter() - started,
-                "status": 0, "error": f"{type(e).__name__}: {e}"[:160]}
+                "status": 0, "topic": topic, "error": f"{type(e).__name__}: {e}"[:160]}
 
 
 async def main() -> None:
@@ -134,10 +143,13 @@ async def main() -> None:
             if times:
                 p50 = statistics.median(times)
                 p95 = times[min(len(times) - 1, int(len(times) * 0.95))]
-                verdict = "OK" if times[-1] < 100 else "!! 100초 초과 - 프록시에서 끊길 수 있음"
+                # 100초는 더 이상 절대선이 아니다. 하트비트 응답(app/core/keepalive.py)이
+                # 프록시 제한을 없앴고, 파드에서 140초 요청이 통과하는 것을 확인했다.
+                # 다만 사용자가 기다리는 시간이므로 넘으면 계속 표시한다.
+                verdict = "OK" if times[-1] < 100 else "100초 초과 (하트비트로 전달은 되지만 체감이 길다)"
                 print(f"          p50 {p50:.1f}초  p95 {p95:.1f}초  최대 {times[-1]:.1f}초  {verdict}")
             for r in bad:
-                print(f"          실패 status={r['status']}  {r.get('error')}")
+                print(f"          실패 [{r.get('topic')}] status={r['status']}  {r.get('error')}")
             print()
 
     if A.rounds > 1:

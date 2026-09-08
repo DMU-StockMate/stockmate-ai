@@ -94,11 +94,18 @@ async def run(args):
             header_at = time.monotonic() - t0
             print(f"[{header_at:6.1f}s] 헤더 도착  status={r.status_code} "
                   f"content-type={r.headers.get('content-type')} "
-                  f"transfer-encoding={r.headers.get('transfer-encoding', '-')}")
+                  f"transfer-encoding={r.headers.get('transfer-encoding', '-')} "
+                  f"content-encoding={r.headers.get('content-encoding', '-')}")
             if r.status_code != 200:
                 print(await r.aread())
                 return 1
-            async for chunk in r.aiter_raw():
+            # aiter_raw 가 아니라 aiter_bytes 를 쓴다. Cloudflare 가 응답을 gzip 으로
+            # 압축하기 때문이다(2026-09-08 파드에서 확인). raw 로 읽으면 공백 하트비트가
+            # 압축 바이트로 보여 박동을 못 센다. aiter_bytes 는 청크가 도착할 때마다
+            # 풀어 주므로 도착 시각은 그대로 보존된다.
+            async for chunk in r.aiter_bytes():
+                if not chunk:
+                    continue
                 at = time.monotonic() - t0
                 if chunk.strip() == b"":
                     beats.append((at, len(chunk)))
