@@ -81,8 +81,8 @@ class QuizCategoryIn(BaseModel):
 class PromptQuizGenerateRequest(BaseModel):
     """자유 프롬프트로 문제를 만든다.
 
-    ⚠️ **`quiz_type` 과 `count` 를 받지 않는다.** 보내도 조용히 무시된다.
-    문제 유형과 개수는 서버가 프롬프트를 읽어서 정한다.
+    ⚠️ **`quiz_type` 은 받지 않는다.** 보내도 무시되고, 문제 유형은 서버가
+    프롬프트를 읽어서 정한다. `count` 는 받는다(아래 참고).
     """
     prompt: str = Field(
         description=(
@@ -98,6 +98,19 @@ class PromptQuizGenerateRequest(BaseModel):
         examples=["PER과 PBR의 차이를 확인하는 문제를 5개 만들어줘"],
     )
     user: UserContext
+    count: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description=(
+            "만들 문제 수. **주면 프롬프트에서 읽은 개수보다 우선한다.**\n\n"
+            "화면에서 사용자가 개수를 고르는 UI 가 있다면 그 값을 그대로 넣으면 된다. "
+            "생략하면 프롬프트 문장에서 읽고, 문장에도 없으면 서버 기본값(3)을 쓴다.\n\n"
+            "⚠️ **개수가 곧 대기 시간이다.** 1개는 약 40초, 3개는 약 60~105초다. "
+            "앞단(nginx 등) 타임아웃이 짧다면 개수를 줄이는 것이 가장 확실한 완화책이다."
+        ),
+        examples=[1],
+    )
 
 
 class PromptQuizQuestion(QuizGenerateResponse):
@@ -202,16 +215,28 @@ class WrongAnswerItem(BaseModel):
 class ReviewQuizGenerateRequest(BaseModel):
     """오답 기록으로 복습 문제를 만든다.
 
-    ⚠️ **`quiz_type` 과 `count` 를 받지 않는다.** 보내도 조용히 무시된다.
-    응답은 **항상 5문제**이고, 유형은 오답의 성격에 맞춰 서버가 정한다.
+    ⚠️ **`quiz_type` 은 받지 않는다.** 유형은 오답의 성격에 맞춰 서버가 정한다.
+    `count` 는 받는다 — 생략하면 5문제다.
     """
     user: UserContext
     wrong_answers: list[WrongAnswerItem] = Field(
         description=(
             "유저가 틀린 문제들. `WHERE user_id = ? AND is_correct = FALSE` 로 조회한 결과를 "
             "이 형태로 담는다. 빈 배열이면 **422**.\n\n"
-            "여러 개를 넣으면 서버가 주제별로 묶어 5문제를 배분한다."
+            "여러 개를 넣으면 서버가 주제별로 묶어 문제 수를 배분한다 "
+            "(많이 틀린 주제가 더 많이 가져간다)."
         )
+    )
+    count: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description=(
+            "만들 문제 수. 생략하면 **5개**다.\n\n"
+            "⚠️ **개수가 곧 대기 시간이다.** 앞단 타임아웃이 짧다면 줄이는 것이 "
+            "가장 확실한 완화책이다."
+        ),
+        examples=[1],
     )
 
 

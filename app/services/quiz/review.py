@@ -55,6 +55,8 @@ class NoWrongAnswerError(ValueError):
 
 # 고정 5문제 (팀 결정). 순차 생성이라 개수를 늘리면 응답 시간이 비례해 늘어난다.
 REVIEW_QUIZ_COUNT = 5
+# 요청으로 지정할 수 있는 상한. 개수가 곧 GPU 작업량이고 사용자 대기 시간이다.
+MAX_REVIEW_QUIZ_COUNT = 10
 
 # 한 주제당 프롬프트에 넣을 오답 예시 수.
 # 너무 많이 넣으면 컨텍스트가 길어지고 LLM이 예시를 그대로 베끼는 경향이 생긴다.
@@ -406,25 +408,31 @@ async def _resolve_categories(groups: list[dict]) -> dict[str, dict]:
 async def generate_quiz_from_wrong_answers(
     user: UserContext,
     wrong_answers: list[WrongAnswerItem],
+    count: int | None = None,
 ) -> list[dict]:
     """오답 기반 문제 생성 파이프라인.
 
     1. 오답을 주제별로 묶고 많이 틀린 순으로 정렬
-    2. 5개 슬롯을 주제에 배분 (많이 틀린 주제가 더 많이 가져감)
+    2. count개 슬롯을 주제에 배분 (많이 틀린 주제가 더 많이 가져감)
     3. 슬롯마다 해당 주제의 오답을 컨텍스트로 넣어 순차 생성
     4. 카테고리 코드 매핑해서 반환 (NestJS 저장용)
+
+    count를 주지 않으면 REVIEW_QUIZ_COUNT(5)개를 만든다.
     """
     if not wrong_answers:
         raise NoWrongAnswerError("오답 데이터가 없습니다.")
 
+    total = REVIEW_QUIZ_COUNT if count is None else count
+    total = max(1, min(int(total), MAX_REVIEW_QUIZ_COUNT))
+
     groups = group_wrong_answers(wrong_answers)
-    slots = allocate_slots(groups, REVIEW_QUIZ_COUNT)
+    slots = allocate_slots(groups, total)
     categories = await _resolve_categories(groups)
 
     summary = ", ".join("{}x{}".format(g["topic"], g["wrong_count"]) for g in groups)
     logger.info(
         f"오답 기반 생성: 오답 {len(wrong_answers)}개 → 주제 {len(groups)}개 "
-        f"[{summary}] → 문제 {REVIEW_QUIZ_COUNT}개"
+        f"[{summary}] → 문제 {total}개"
     )
 
     # 주제별로 과거 생성 이력만큼 관점을 밀어둔다.
@@ -492,7 +500,7 @@ async def generate_quiz_from_wrong_answers(
     # 재시도는 세트 밖 관점으로 민다 - 같은 관점이면 같은 문제가 또 나온다.
     async def retry_dup(i: int, avoid: list[str]) -> dict:
         return await make(
-            i, avoid, angle_for(slot_index[specs[i]["key"]] + REVIEW_QUIZ_COUNT))()
+            i, avoid, angle_for(slot_index[specs[i]["key"]] + total))()
 
     await resolve_duplicates(questions, retry_dup, user)
 

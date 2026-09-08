@@ -150,9 +150,12 @@ async def generate(req: QuizGenerateRequest):
 - 명시가 없으면 기본 3개 (서버 설정 `PROMPT_QUIZ_DEFAULT_COUNT`)
 - 최대 10개 (초과 요청 시 10개로 제한)
 
-⚠️ **`quiz_type` 과 `count` 는 받지 않습니다.** 보내도 조용히 무시됩니다.
-유형과 개수는 서버가 프롬프트를 읽어서 정합니다. 개수를 지정하고 싶으면
-프롬프트 문장 안에 `"...5개 만들어줘"` 처럼 적어 주세요.
+**개수 지정**
+- `count` 를 보내면 그 개수로 만듭니다 (1~10). 화면에서 사용자가 고른 값을
+  그대로 넣으면 됩니다.
+- 생략하면 프롬프트 문장에서 읽고(`"...5개 만들어줘"`), 문장에도 없으면 3개입니다.
+
+⚠️ **`quiz_type` 은 받지 않습니다.** 문제 유형은 서버가 프롬프트를 보고 정합니다.
 
 ⚠️ **주제를 못 찾으면 422 입니다.** 주제는 `user.investment_level` 에 해당하는
 카테고리 안에서만 찾습니다. 초급 사용자가 `당기순이익`(중급 개념)을 요청하면
@@ -280,6 +283,7 @@ async def generate_from_prompt(req: PromptQuizGenerateRequest):
         results = await generate_quiz_from_prompt(
             prompt=req.prompt,
             user=req.user,
+            count=req.count,
         )
         return PromptQuizGenerateResponse(
             prompt=req.prompt,
@@ -318,10 +322,9 @@ async def generate_from_prompt(req: PromptQuizGenerateRequest):
 → 실제 적용 → 예외 상황). 같은 주제에서 사실상 같은 문제가 반복되는 것을 막습니다.
 
 **문제 개수**
-- 항상 {REVIEW_QUIZ_COUNT}개 고정입니다.
+- `count` 를 보내면 그 개수(1~10), 생략하면 **{REVIEW_QUIZ_COUNT}개**입니다.
 
-⚠️ **`quiz_type` 과 `count` 는 받지 않습니다.** 보내도 조용히 무시되고
-항상 {REVIEW_QUIZ_COUNT}개가 옵니다. 유형은 오답의 성격에 맞춰 서버가 정합니다.
+⚠️ **`quiz_type` 은 받지 않습니다.** 유형은 오답의 성격에 맞춰 서버가 정합니다.
 
 **NestJS가 보낼 데이터**
 
@@ -416,6 +419,7 @@ async def generate_from_wrong_answers(req: ReviewQuizGenerateRequest):
         results = await generate_quiz_from_wrong_answers(
             user=req.user,
             wrong_answers=req.wrong_answers,
+            count=req.count,
         )
         return ReviewQuizGenerateResponse(
             questions=[PromptQuizQuestion(**r) for r in results],

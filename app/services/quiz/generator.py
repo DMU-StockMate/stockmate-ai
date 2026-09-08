@@ -973,8 +973,19 @@ async def _analyze_once(prompt: str, categories: list[QuizCategoryIn]) -> list[d
         count = int(data.get("count") or len(items))
     except (TypeError, ValueError):
         count = len(items)
-    count = max(1, min(count, MAX_PROMPT_QUIZ_COUNT))
+    return resize_plan(items, count)
 
+
+def resize_plan(items: list[dict], count: int) -> list[dict]:
+    """출제 계획을 정확히 count개로 맞춘다.
+
+    부족하면 기존 항목을 순환 복제해 채우고, 초과분은 자른다.
+    분석 단계(프롬프트에서 읽은 개수)와 요청 단계(백엔드가 지정한 count)가
+    같은 규칙을 쓰도록 함수로 뽑았다.
+    """
+    count = max(1, min(int(count), MAX_PROMPT_QUIZ_COUNT))
+    if not items:
+        return items
     if len(items) < count:
         base = list(items)
         while len(items) < count:
@@ -1031,7 +1042,11 @@ async def _map_topics_to_catalog(
     return result
 
 
-async def analyze_quiz_prompt(prompt: str, investment_level: str = "미설정") -> list[dict]:
+async def analyze_quiz_prompt(
+    prompt: str,
+    investment_level: str = "미설정",
+    count: int | None = None,
+) -> list[dict]:
     """프롬프트를 분석해 검증된 출제 계획(항목 리스트)을 반환한다.
 
     1차: 사용자 수준에 해당하는 등급의 카테고리만 LLM에 보여주고 분석한다
@@ -1041,6 +1056,8 @@ async def analyze_quiz_prompt(prompt: str, investment_level: str = "미설정") 
     해당 항목만 매핑이 비므로, 매핑 실패 항목의 주제만 모아 전체 카탈로그로
     재매핑한다 — 초급 유저도 고급 카테고리 주제의 문제를 풀 수 있게 한다.
     ("PER이랑 볼린저밴드"처럼 섞인 요청도 볼린저밴드만 재매핑되어 처리됨)
+
+    count를 주면 프롬프트에서 읽은 개수 대신 그 개수로 맞춘다.
 
     실패 시 PromptTopicError를 던진다 (라우터가 422로 변환).
     """
@@ -1066,17 +1083,25 @@ async def analyze_quiz_prompt(prompt: str, investment_level: str = "미설정") 
                 item["category_code"] = mapping["category_code"]
                 item["detail_codes"] = mapping["detail_codes"]
 
+    # 백엔드가 count 를 지정하면 프롬프트에서 읽은 개수보다 우선한다.
+    # (사용자가 화면에서 개수를 고르는 UI 가 있으면 그쪽이 최종 의도다)
+    if count is not None:
+        items = resize_plan(items, count)
     return items
 
 
-async def generate_quiz_from_prompt(prompt: str, user: UserContext) -> list[dict]:
+async def generate_quiz_from_prompt(
+    prompt: str,
+    user: UserContext,
+    count: int | None = None,
+) -> list[dict]:
     """프롬프트 기반 문제 생성 파이프라인 (분석 → 순차 생성).
 
     generate_quiz_batch와 같은 이유(로컬 Ollama 단일 인스턴스)로 순차 생성하고,
     같은 topic 항목이 연속되면 중복 문제가 나올 수 있어 동일한 중복 1회 재시도를 적용한다.
     개별 문제 생성 실패(재시도 3회 소진)는 ValueError로 전파된다 (라우터에서 500).
     """
-    plan = await analyze_quiz_prompt(prompt, user.investment_level)
+    plan = await analyze_quiz_prompt(prompt, user.investment_level, count)
     logger.info(
         f"프롬프트 퀴즈 계획: {len(plan)}개 "
         f"[{', '.join(item['topic'] for item in plan)}]"

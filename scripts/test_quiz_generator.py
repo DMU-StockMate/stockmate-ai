@@ -429,6 +429,44 @@ def test_generate_from_prompt():
         check("무관한 프롬프트 -> PromptTopicError", True)
 
 
+def test_count_override():
+    """요청 count 가 프롬프트에서 읽은 개수보다 우선해야 한다.
+
+    백엔드가 count=1 을 보냈는데 3개가 오는 문제를 실제로 겪었다.
+    이 경로는 count 를 아예 받지 않고 있었다 (pydantic 이 여분 필드를 조용히 버림).
+    """
+    print("\n--- 요청 count 우선 (/quiz/generate/prompt) ---")
+
+    plan = {"relevant": True, "count": 3, "items": [
+        {"topic": "PER", "question_type": "MULTIPLE_CHOICE",
+         "category_code": "BEGINNER_FINANCIAL_BASIC", "detail_codes": ["PER_BASIC"]},
+        {"topic": "배당", "question_type": "MULTIPLE_CHOICE",
+         "category_code": "BEGINNER_STOCK_BASIC", "detail_codes": ["DIVIDEND"]},
+        {"topic": "PBR", "question_type": "MULTIPLE_CHOICE",
+         "category_code": "BEGINNER_FINANCIAL_BASIC", "detail_codes": ["PBR_BASIC"]},
+    ]}
+    ok3 = {"results": [{"no": i, "ok": True, "reason": ""} for i in (1, 2, 3)]}
+
+    reset(analyze=plan, validate=ok3)
+    qs = asyncio.run(G.generate_quiz_from_prompt("PER 문제 만들어줘", USER))
+    check("count 미지정이면 계획대로 3개", len(qs) == 3, len(qs))
+
+    reset(analyze=plan, validate=ok3)
+    qs = asyncio.run(G.generate_quiz_from_prompt("PER 문제 만들어줘", USER, count=1))
+    check("count=1 이면 1개만", len(qs) == 1, len(qs))
+    check("잘라도 매핑은 유지", qs[0]["category_code"] == "BEGINNER_FINANCIAL_BASIC")
+
+    # 계획보다 많이 요청하면 기존 항목을 순환 복제해 채운다
+    reset(analyze=plan,
+          validate={"results": [{"no": i, "ok": True, "reason": ""} for i in range(1, 6)]})
+    qs = asyncio.run(G.generate_quiz_from_prompt("PER 문제 만들어줘", USER, count=5))
+    check("count=5 면 5개로 채움", len(qs) == 5, len(qs))
+
+    # 상한 밖 값은 잘라낸다 (라우터의 pydantic 검증과 별개로 방어)
+    check("resize_plan 상한", len(G.resize_plan(list(plan["items"]), 99)) == G.MAX_PROMPT_QUIZ_COUNT)
+    check("resize_plan 하한", len(G.resize_plan(list(plan["items"]), 0)) == 1)
+
+
 # =========================================================
 # 4-b. 문제 유형 통일 / 카테고리 등급 우선
 # =========================================================
@@ -1010,6 +1048,7 @@ if __name__ == "__main__":
     test_deterministic_checks()
     test_generate_batch()
     test_generate_from_prompt()
+    test_count_override()
     test_question_type_enforcement()
     test_remap_prefers_user_level()
     test_angle_rotation()
