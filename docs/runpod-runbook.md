@@ -470,7 +470,8 @@ Invoke-RestMethod "https://api.runpod.io/v2/pods/<POD_ID>" -Method Delete -Heade
 패키지 누락은 Dockerfile 끝의 `import app.main` 게이트가 빌드에서 잡아준다
 (파드가 아니라 빌드에서 실패하는 것이 설계 의도다).
 
-**튜닝 값 불일치는 이제 스크립트가 잡아준다.** 커밋 전에 한 번 돌릴 것:
+**튜닝 값 불일치는 이제 스크립트가 잡아준다.** 사람이 매번 챙길 일이 아니라,
+설정을 건드린 세션이 마지막에 한 번 돌려서 확인하는 용도다.
 
 ```powershell
 uv run python scripts/check_env_parity.py
@@ -495,7 +496,6 @@ Ollama 시절 값으로 남아 있고 `LLM_MODEL` 이 중복 정의된 것을 �
 
 ```powershell
 docker start qdrant                     # 컨테이너 이름 qdrant, 재시작 정책 없음
-uv run python scripts/check_env_parity.py   # 서버 설정과 어긋났는지 먼저 확인
 uv run uvicorn app.main:app --reload
 ```
 
@@ -517,6 +517,19 @@ LLM 은 `.env` 가 OpenRouter(`qwen/qwen3.8-27b`)를 보고 있다. 유휴 비�
 | **프록시 100초 제한** | ❌ 안 나타남 | Cloudflare 가 없다 |
 | **gzip 압축** | ❌ 안 나타남 | 계측 시 함정(§9) |
 | 동시성/처리량 | ❌ 다름 | OpenRouter는 변동폭이 2배까지 난다 |
+
+**런타임 차이 (2026-09-09 실측)**
+
+| | 로컬 | 이미지 | 위험도 |
+|---|---|---|---|
+| 앱 코드 | 작업트리 | `0.1.7` | 같음 (빌드 시점 커밋과 대조할 것) |
+| 파이썬 패키지 | `pyproject.toml` 14개 | `requirements-server.txt` 14개 | **목록 동일** |
+| Python | 3.11.15 | 3.12 (vllm 베이스) | 낮음 — Dockerfile 끝의 `import app.main` 게이트가 빌드에서 3.12 호환을 검사한다 |
+| Qdrant | 1.18.1 (컨테이너) | 1.18.2 (번들) | 무시 가능 |
+| 임베딩 | bge-m3 / cpu | bge-m3 / cuda | 같은 모델, 속도만 다름 |
+
+버전 핀이 `>=` 라서 **이미지를 새로 빌드하면 로컬보다 최신 패키지를 잡을 수 있다.**
+로컬은 `uv.lock` 으로 고정돼 있다. 빌드 후 스모크에서 이상하면 이걸 의심할 것.
 
 **`--reload` 함정**: 리로더를 죽여도 자식 프로세스가 포트 8000 과 로그 파일을
 붙들고 있어 재시작이 조용히 실패한다. `taskkill /F /T /PID <리로더PID>` 로
