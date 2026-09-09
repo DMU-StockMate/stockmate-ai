@@ -463,27 +463,70 @@ Invoke-RestMethod "https://api.runpod.io/v2/pods/<POD_ID>" -Method Delete -Heade
 | 개발 중 한 일 | 같이 해야 할 일 |
 |---|---|
 | 파이썬 패키지 추가 (`uv add ...`) | **`requirements-server.txt` 에도 추가** |
-| `.env` 에서 튜닝 값 변경 (`LLM_REASONING_EFFORT`, `LLM_MAX_TOKENS`, `EMBEDDING_DEVICE`) | **`Dockerfile` ENV 블록에도 반영** |
+| `.env` 에서 튜닝 값 변경 | **`Dockerfile` ENV + `.env.example` 에도 반영** |
+| 설정 항목 추가 (`config.py`) | 위와 같음 — 네 곳(`config.py` / `.env` / `Dockerfile` / `.env.example`) |
 | API 키 재발급 | RunPod 템플릿 `c3bqwiolqi` 의 env 도 갱신 |
 
 패키지 누락은 Dockerfile 끝의 `import app.main` 게이트가 빌드에서 잡아준다
-(파드가 아니라 빌드에서 실패하는 것이 설계 의도다). 튜닝 값 불일치는 아무도
-잡아주지 않으니 사람이 챙겨야 한다.
+(파드가 아니라 빌드에서 실패하는 것이 설계 의도다).
+
+**튜닝 값 불일치는 이제 스크립트가 잡아준다.** 커밋 전에 한 번 돌릴 것:
+
+```powershell
+uv run python scripts/check_env_parity.py
+```
+
+Dockerfile ENV ↔ `.env` ↔ `.env.example` 를 대조하고, 같은 키가 두 번 정의된
+경우(뒤엣것이 이겨 조용히 어긋난다)도 잡는다. 실제로 이걸로 `.env.example` 이
+Ollama 시절 값으로 남아 있고 `LLM_MODEL` 이 중복 정의된 것을 찾았다.
+
+**로컬과 서버가 달라야 정상인 항목은 네 개뿐이다** (스크립트의 화이트리스트):
+
+| 항목 | 로컬 | 서버 |
+|---|---|---|
+| `LLM_BACKEND` / `LLM_BASE_URL` / `LLM_MODEL` | OpenRouter, `qwen/qwen3.8-27b` | vLLM, `qwen3.8-27b` |
+| `EMBEDDING_DEVICE` | `cpu` | `cuda` |
+| `QDRANT_HOST` | `localhost` | `127.0.0.1` |
+| `APP_PORT` | `8000` | `8080` |
+
+나머지(퀴즈 튜닝·하트비트·사고 강도)는 **전부 같은 값이어야 한다.**
 
 ### 일상 개발 환경 (참고)
 
 ```powershell
 docker start qdrant                     # 컨테이너 이름 qdrant, 재시작 정책 없음
+uv run python scripts/check_env_parity.py   # 서버 설정과 어긋났는지 먼저 확인
 uv run uvicorn app.main:app --reload
 ```
 
+백엔드가 다른 기기에서 붙는다면 `--host 0.0.0.0 --port 8000` 을 붙인다.
+그때는 `.env` 의 `AI_API_KEY` 를 **서버와 같은 값으로 채울 것** — 비워 두면
+인증이 꺼져서 401 경로를 로컬에서 못 잡는다(실제로 이것 때문에 베타에서
+백엔드 401 을 늦게 발견했다).
+
 LLM 은 `.env` 가 OpenRouter(`qwen/qwen3.8-27b`)를 보고 있다. 유휴 비용 0,
 퀴즈 1건 약 $0.006. 서버와 같은 모델이라 품질 판단에 그대로 쓸 수 있다.
-로컬 llama-server 로 되돌리려면 `.env` 의 롤백용 주석 블록 참고.
+
+**로컬에서 재현되는 것 / 안 되는 것**
+
+| | 로컬 | 비고 |
+|---|---|---|
+| 하트비트 응답 | ✅ 그대로 동작 | 30초 넘기면 공백 박동 |
+| 인증(401) | ✅ `AI_API_KEY` 채우면 동일 | |
+| SSE 빈 토큰 필터 | ✅ | |
+| **프록시 100초 제한** | ❌ 안 나타남 | Cloudflare 가 없다 |
+| **gzip 압축** | ❌ 안 나타남 | 계측 시 함정(§9) |
+| 동시성/처리량 | ❌ 다름 | OpenRouter는 변동폭이 2배까지 난다 |
+
+**`--reload` 함정**: 리로더를 죽여도 자식 프로세스가 포트 8000 과 로그 파일을
+붙들고 있어 재시작이 조용히 실패한다. `taskkill /F /T /PID <리로더PID>` 로
+트리째 죽일 것. 오래 띄워둘 때는 `--reload` 없이 쓰는 편이 낫다.
 
 ### 1. 버전 정하기
 
-**태그를 절대 덮어쓰지 말 것.** 항상 올린다. 현재까지: `0.1.0` → `0.1.1` → `0.1.2`.
+**태그를 절대 덮어쓰지 말 것.** 항상 올린다.
+현재까지: `0.1.0` → `0.1.1` → `0.1.2` → `0.1.3` → `0.1.4` → `0.1.5` → `0.1.6` → **`0.1.7`**.
+템플릿 `c3bqwiolqi` 는 `0.1.7` 을 가리킨다.
 
 ### 2. 튜닝 값 동기화 (빠뜨리기 쉬움)
 
@@ -711,11 +754,25 @@ KIS_ACCOUNT         {{ RUNPOD_SECRET_KIS_ACCOUNT }}
    으로 바꿔 던져 전역 핸들러를 타지 않고, 재시도 루프는 `except: continue` 로
    사유를 버렸다. → `generator.py` 두 루프에 시도별 WARNING + 소진 시 ERROR 추가.
 
-### 틀렸던 가설 (기록용)
+### 틀렸던 가설 — 그리고 그 정정 (2026-09-05/08)
 
-리허설 중반에 "RunPod 프록시가 80초에서 끊는다"고 판단했으나 **틀렸다.**
-`count=4` 요청이 **98.9초에 정상 완료**했다. 80초 부근 실패는 전부 위 2번
-(3회 재시도 소진 = 3 × 약 26초)이었다. 프록시 타임아웃 제한은 확인되지 않았다.
+리허설 중반에 "RunPod 프록시가 80초에서 끊는다"고 판단했다가, `count=4` 요청이
+**98.9초에 정상 완료**하는 것을 보고 "제한은 확인되지 않았다"로 기록했었다.
+
+**그 기록이 틀렸다.** 98.9초는 100초를 넘겨서 통과한 게 아니라 **안 넘겨서**
+통과한 것이다. 2026-09-05 파드에서 동시 20명 프롬프트 퀴즈가 100초를 넘기자
+**20건 전부 HTTP 524** 로 떨어졌다.
+
+> **RunPod HTTP 프록시(Cloudflare)는 응답 첫 바이트까지 100초를 기다린 뒤
+> 524 로 끊는다.** 그때도 서버는 요청을 정상 처리하고 있다 — 클라이언트가 524 를
+> 받은 뒤에도 `퀴즈 뱅크 저장` 이 계속 찍혔다. **생성이 아니라 전달이 실패한다.**
+
+**0.1.5 부터 이 벽은 없앴다.** 응답이 30초를 넘기면 10초마다 공백을 흘려보내
+연결을 살려 둔다(`app/core/keepalive.py`). 파드에서 140초 요청 정상 도착,
+동시 20명에서 324초 요청까지 524 0건을 확인했다.
+80초 부근 실패는 여전히 위 2번(재시도 소진)일 수 있으니 로그를 볼 것.
+
+자세한 경위: `claude/stockmate-ai-improvements.md`
 
 ### 남은 개선 (선택)
 
@@ -811,9 +868,19 @@ RUNPOD_TEMPLATE_VLLM_ONLY=beonudgm8k  RUNPOD_DATACENTER=AP-JP-1
   파드를 지울 때 같이 사라진다. 이 런북 전체가 이 한 줄을 위한 것이다.
 - **Expose HTTP Ports 에 8000 을 안 적으면** 프록시가 라우팅을 안 한다.
   포트를 열었는데 502 면 이걸 먼저 본다.
-- **RunPod HTTP 프록시는 Cloudflare 100초 타임아웃**이 걸린다.
-  `reasoning_effort=xhigh` 로 긴 생성을 하면 프록시에서 먼저 끊긴다.
-  100초를 넘겨야 한다면 TCP 직결 포트(Connect → Direct TCP Ports)를 쓴다.
+- **RunPod HTTP 프록시는 Cloudflare 100초 타임아웃**이 걸린다 (2026-09-05 실측 확인).
+  **0.1.5 부터 하트비트 응답으로 무력화했으므로 지금은 신경 쓸 필요가 없다.**
+  단, 524 가 다시 보이면 `RESPONSE_KEEPALIVE_ENABLED` 가 꺼졌는지부터 본다.
+  (TCP 직결 포트는 HTTPS 가 아니게 되므로 공개 URL 로는 부적절 — 최후 수단)
+- **프록시가 응답을 gzip 으로 압축한다.** 프록시 뒤를 계측할 때 raw 바이트를 읽으면
+  압축된 것을 보게 된다. 로컬(127.0.0.1)에서는 압축이 없어 이 함정이 안 보인다.
+  프록시 경유 측정에는 `scripts/check_keepalive.py` / `check_chat_stream.py` 를 쓸 것.
+- **uvicorn access log 를 끄지 말 것.** 한때 entrypoint 가 `--no-access-log` 로
+  띄우고 있었는데, "어떤 요청이 몇 초에 어떤 상태 코드로 끝났는지"를 볼 수 없어
+  연동 장애 추적이 하루씩 걸렸다. 켜 두면 10분이면 잡힌다.
+- **새 모듈에서 `logging.getLogger(__name__)` 을 쓰지 말 것.** 이 프로젝트는
+  로거마다 핸들러를 직접 붙이는 구조(`app/core/logger.py`)라 맨 getLogger 는
+  핸들러도 레벨도 없어 **INFO 로그가 통째로 사라진다.** 반드시 `setup_logger`.
 - **`reasoning_effort` 기본값이 `xhigh`.** 서버 기동 플래그로 못박는 게 가장 안전.
 - **파드 Stop 은 GPU 반납이다.** 재고가 빠지면 Start 가 안 된다.
   긴 공백이라면 Terminate 하고 나중에 재배포하는 편이 낫다 (가중치는 남으므로).
