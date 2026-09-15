@@ -45,6 +45,18 @@ class Settings(BaseSettings):
     # 빈 문자열이면 LLM_REASONING_EFFORT 를 그대로 쓴다.
     CHAT_REASONING_EFFORT: str = "none"
     LLM_MAX_TOKENS: int = 0
+
+    # OpenRouter 는 모델 이름 하나 뒤에 여러 프로바이더를 두고, 양자화가 제각각이다.
+    # 2026-09-15 실측 (qwen/qwen3.8-27b): 프로바이더 16곳에 bf16 / fp8 / fp4 / unknown 혼재.
+    # 고정하지 않으면 요청마다 다른 곳으로 가서 같은 코드를 두 번 재도 수치가 흔들린다
+    # (같은 요청 10회 -> 6개 프로바이더, 그중 fp4 가 3회).
+    # 파드는 Qwen3.8-27B-FP8 이므로 로컬도 fp8 로 맞춰 측정을 재현 가능하게 한다.
+    # 주의: "파드와 같은 출력"이 되는 게 아니라 "매번 같은 조건"이 되는 것뿐이다.
+    # LLM_BASE_URL 이 openrouter.ai 일 때만 요청에 실린다 (vLLM 에는 나가지 않는다).
+    LLM_OPENROUTER_QUANTIZATIONS: str = "fp8"
+    # 지정한 양자화를 서빙하는 곳이 없을 때 다른 정밀도로 흘러가도 되는지.
+    # False 면 실패한다 - 모르는 사이 fp4 로 재는 것보다 낫다.
+    LLM_OPENROUTER_ALLOW_FALLBACKS: bool = False
     # 이 AI 서버 자체의 인증 키 (외부 노출 시 필수)
     # 비워두면 인증을 끈다 - 로컬 개발용. 포트포워딩할 때는 반드시 채울 것.
     AI_API_KEY: str = ""

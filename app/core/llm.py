@@ -48,6 +48,20 @@ def build_llm(temperature: float, num_predict: int = 1024, num_ctx: int = 6144,
         if effort:
             extra_body["reasoning_effort"] = effort
 
+        # OpenRouter 로 나갈 때만 프로바이더 라우팅을 지정한다.
+        # 같은 모델 이름 뒤에 양자화가 다른 프로바이더가 여럿 붙어 있어, 고정하지 않으면
+        # 요청마다 정밀도가 바뀐다 (config.LLM_OPENROUTER_QUANTIZATIONS 주석 참고).
+        # vLLM 은 이 필드를 모르므로 파드로는 보내지 않는다.
+        if "openrouter.ai" in (settings.LLM_BASE_URL or ""):
+            quantizations = [q.strip()
+                             for q in settings.LLM_OPENROUTER_QUANTIZATIONS.split(",")
+                             if q.strip()]
+            if quantizations:
+                extra_body["provider"] = {
+                    "quantizations": quantizations,
+                    "allow_fallbacks": settings.LLM_OPENROUTER_ALLOW_FALLBACKS,
+                }
+
         return ChatOpenAI(
             base_url=settings.LLM_BASE_URL,
             api_key=settings.LLM_API_KEY,
