@@ -56,6 +56,23 @@ def _make_id(text: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, text))
 
 
+def _disclosure_doc_id(ticker: str, item: dict) -> str:
+    """공시 문서 id. 저정보 공시는 (종목·보고서명·날짜) 기준으로 한 건에 접는다.
+
+    저정보 공시는 원문 본문을 받지 않으므로 저장 내용이
+    "{회사명} 공시: {보고서명}\n날짜: {날짜}" 뿐이다. 같은 날 여러 임원이 각자 제출하면
+    보고서명과 날짜가 같아 내용이 완전히 동일해지는데, id 를 접수번호(url) 기준으로 만들면
+    서로 다른 문서로 쌓인다.
+    (실측 2026-09-15: 삼성전자 공시 134건 중 97건이 내용 완전중복, 20260721 임원소유상황
+     보고서만 56건. "대창단조 최근 공시" 질의에서 채택 5칸 중 3칸을 동일 문서가 차지했다.)
+
+    본문이 없으니 접어도 잃는 정보가 없다.
+    """
+    if is_low_info_report(item["title"]):
+        return _make_id(f"dart_low_info:{ticker}:{item['title']}:{item['date']}")
+    return _make_id(item["url"])
+
+
 # 공시 본문(dart.py)에서도 같은 변환이 필요해져 dart.py 로 옮겼다. 호출부 호환용 별칭.
 _format_krw_human = format_krw_human
 
@@ -146,7 +163,7 @@ async def ingest_disclosures(ticker: str, days: int = 90) -> int:
 
     # 1) 먼저 id를 계산하고 기존재 문서를 배치 retrieve로 걸러낸다.
     #    (공시 원문 조회는 비싸므로 '새 공시'에 대해서만 본문을 받는다)
-    ids = [_make_id(item["url"]) for item in items]
+    ids = [_disclosure_doc_id(ticker, item) for item in items]
     client = vs.client
     try:
         existing = client.retrieve(collection_name=vs.collection_name, ids=ids)
@@ -154,7 +171,15 @@ async def ingest_disclosures(ticker: str, days: int = 90) -> int:
     except Exception:
         existing_ids = set()
 
-    new_items = [(item, id_) for item, id_ in zip(items, ids) if id_ not in existing_ids]
+    # 저정보 공시를 접으면 같은 요청 안에서도 id 가 겹친다(같은 날 제출 여러 건).
+    # 겹치는 건 한 번만 적재한다.
+    new_items = []
+    seen: set[str] = set()
+    for item, id_ in zip(items, ids):
+        if id_ in existing_ids or id_ in seen:
+            continue
+        seen.add(id_)
+        new_items.append((item, id_))
     if not new_items:
         _update_dart_cache(ticker)
         return 0
