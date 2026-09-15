@@ -161,31 +161,86 @@ _UNIT_MULTIPLIER = {"백만": 1_000_000, "천": 1_000, "만": 10_000, "": 1}
 _BIG_NUMBER = re.compile(r"(?<![\d,.])\d{1,3}(?:,\d{3}){2,}(?![\d,]*\.\d)(?![\d,])")
 _AMOUNT_HINT = ("매출", "영업이익", "순이익", "자산", "부채", "자본", "이익", "손실", "금액", "규모")
 
+# 한 공시 안에도 단위가 섞여 있다. 문서 전체에 단위 선언 하나를 적용하면 두 가지가 깨진다.
+#   1) 주식 수에 원화가 붙는다 - '발행주식총수 (주) 712,702,365' -> '(약 712.70조원)'
+#   2) 자기 단위를 밝힌 칸까지 곱해진다 - '시설자금(원) 43,140,750,000,000' -> '(약 43,140,750조원)'
+#      (실제 43.14조원. 100만 배 부풀려진 값이다. 이 문서는 단위 선언이 해당 숫자보다
+#       뒤에 있었는데도 적용됐다.)
+# 컨텍스트에 "다시 계산하지 말고 그대로 인용할 것"이 함께 가므로 LLM 이 이 값을 사실로 인용한다.
+# 그래서 숫자마다 (a) 수량 칸인지 (b) 어떤 단위가 지배하는지를 따로 판정한다.
+_QTY_CONTEXT = re.compile(r"주식|보통주|우선주|수량|주당|\(\s*주\s*\)")
+# 숫자 바로 뒤에 '주'가 붙는 경우 ('17,790,000 주', '1,289,120 주1)')
+_QTY_SUFFIX = re.compile(r"^\s*주")
+# 칸 라벨이 스스로 밝힌 단위 ('시설자금(원)', '취득금액(백만원)') - 문서 선언보다 우선한다
+_CELL_UNIT = re.compile(r"\(\s*([백천]?만?)\s*원\s*\)")
+_CELL_LABEL_WINDOW = 60
+
+
+def _cell_label(text: str, start: int) -> str:
+    """숫자 앞의 '같은 칸 라벨'만 잘라낸다.
+
+    표는 '라벨 숫자 라벨 숫자 …' 로 이어지므로, 바로 앞 숫자 뒤의 텍스트가 이 칸의 라벨이다.
+    고정 폭으로 앞을 보면 옆 칸(금액 칸 옆의 주식 수 칸 등)까지 들어와 오판한다.
+    """
+    window = text[max(0, start - _CELL_LABEL_WINDOW):start]
+    last_digit = max((window.rfind(d) for d in "0123456789"), default=-1)
+    return window[last_digit + 1:]
+
 
 def annotate_amounts(text: str) -> str:
     """공시 본문이 선언한 금액 단위를 읽어, 큰 숫자 옆에 조/억원 환산값을 붙인다.
 
-    단위 선언이 없거나 금액 관련 표가 아니면 아무것도 하지 않는다 (주식수·수량 오탐 방지).
+    숫자 하나하나에 대해 이렇게 판정한다.
+    - 칸 라벨이나 숫자 바로 뒤가 수량 표시(주식·보통주·수량·(주))면 건너뛴다.
+    - 칸 라벨이 단위를 밝히면 그 단위를 쓴다.
+    - 아니면 그 숫자보다 **앞에 있는** 가장 가까운 단위 선언을 쓴다. 앞선 선언이 없으면
+      건너뛴다 - 뒤에 나오는 선언이 앞 숫자를 지배할 근거가 없다.
+
+    환산을 놓치는 쪽이 없는 금액을 만들어내는 쪽보다 안전하다.
     """
-    decl = _UNIT_DECL.search(text or "")
-    if not decl:
+    if not text:
         return text
-    raw_unit = decl.group(1)
-    multiplier = _UNIT_MULTIPLIER.get(raw_unit, 1)
-    if multiplier == 1:
-        return text  # 이미 원 단위면 환산할 게 없다
+    decls = [(m.end(), m.group(1)) for m in _UNIT_DECL.finditer(text)]
+    if not decls:
+        return text
     if not any(h in text for h in _AMOUNT_HINT):
         return text  # 금액 표가 아니면 건드리지 않는다
 
+    def _declared_unit_before(pos: int) -> str | None:
+        unit = None
+        for end, raw in decls:
+            if end > pos:
+                break
+            unit = raw
+        return unit
+
+    used_units: set[str] = set()
+
     def repl(m: re.Match) -> str:
+        label = _cell_label(text, m.start())
+        if _QTY_CONTEXT.search(label) or _QTY_SUFFIX.match(text[m.end():m.end() + 6]):
+            return m.group(0)
+
+        cell = _CELL_UNIT.search(label)
+        raw_unit = cell.group(1) if cell else _declared_unit_before(m.start())
+        if raw_unit is None:
+            return m.group(0)
+        multiplier = _UNIT_MULTIPLIER.get(raw_unit, 1)
+        if multiplier == 1:
+            return m.group(0)  # 이미 원 단위면 환산할 게 없다
+
         human = format_krw_human(int(m.group(0).replace(",", "")) * multiplier)
-        return f"{m.group(0)}({human})" if human else m.group(0)
+        if not human:
+            return m.group(0)
+        used_units.add(raw_unit)
+        return f"{m.group(0)}({human})"
 
     annotated = _BIG_NUMBER.sub(repl, text)
     if annotated == text:
         return text
+    units = "/".join(f"{u}원" for u in sorted(used_units))
     return (
-        f"(숫자 뒤 괄호의 '약 N조원/억원'은 '{raw_unit}원' 단위를 원 단위로 미리 환산해둔 "
+        f"(숫자 뒤 괄호의 '약 N조원/억원'은 '{units}' 단위를 원 단위로 미리 환산해둔 "
         "값이니, 다시 계산하지 말고 그대로 인용할 것)\n" + annotated
     )
 
