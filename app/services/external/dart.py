@@ -177,6 +177,10 @@ _CELL_LABEL_WINDOW = 60
 _LABEL_CHAR = re.compile(r"[가-힣A-Za-z]")
 # 라벨 글자에 붙어 한 덩어리로 읽히는 문자들 ('(주)', '임원ㆍ주요주주', '취득/처분')
 _LABEL_JOINER = "()ㆍ·/"
+# 집계 칸은 자기 단위를 새로 선언하지 않는다. '계' 앞의 진짜 라벨까지 거슬러 봐야 한다.
+# (실측: '보통주식 1,625,769 … 계 1,625,769' 의 마지막 값이 '약 1.63조원' 으로 환산됐다.)
+_AGGREGATE_LABELS = {"계", "합계", "소계", "총계", "누계"}
+_AGGREGATE_HOPS = 4
 
 
 def _cell_label(text: str, start: int) -> str:
@@ -187,16 +191,23 @@ def _cell_label(text: str, start: int) -> str:
     (실측: '보통주식 1,625,769 0.2 92,683 - - - 1,625,769' 에서 두 번째 값이
      주식 수인데 '약 1.63조원' 으로 환산됐다.)
     그래서 숫자·구분자는 건너뛰고 글자가 나오는 가장 가까운 지점까지 거슬러 본다.
+    라벨이 '계' 같은 집계어뿐이면 그 앞의 진짜 라벨까지 한 번 더 거슬러 본다.
     """
     window = text[max(0, start - _CELL_LABEL_WINDOW):start]
-    idx = None
-    for m in _LABEL_CHAR.finditer(window):
-        idx = m.start()
-    if idx is None:
-        return window
-    while idx > 0 and (_LABEL_CHAR.match(window[idx - 1]) or window[idx - 1] in _LABEL_JOINER):
-        idx -= 1
-    return window[idx:]
+    end = len(window)
+    for _ in range(_AGGREGATE_HOPS):
+        idx = None
+        for m in _LABEL_CHAR.finditer(window, 0, end):
+            idx = m.start()
+        if idx is None:
+            return window
+        while idx > 0 and (_LABEL_CHAR.match(window[idx - 1]) or window[idx - 1] in _LABEL_JOINER):
+            idx -= 1
+        letters = "".join(ch for ch in window[idx:end] if _LABEL_CHAR.match(ch))
+        if letters not in _AGGREGATE_LABELS:
+            return window[idx:]
+        end = idx
+    return window
 
 
 def annotate_amounts(text: str) -> str:
