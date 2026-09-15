@@ -174,17 +174,29 @@ _QTY_SUFFIX = re.compile(r"^\s*주")
 # 칸 라벨이 스스로 밝힌 단위 ('시설자금(원)', '취득금액(백만원)') - 문서 선언보다 우선한다
 _CELL_UNIT = re.compile(r"\(\s*([백천]?만?)\s*원\s*\)")
 _CELL_LABEL_WINDOW = 60
+_LABEL_CHAR = re.compile(r"[가-힣A-Za-z]")
+# 라벨 글자에 붙어 한 덩어리로 읽히는 문자들 ('(주)', '임원ㆍ주요주주', '취득/처분')
+_LABEL_JOINER = "()ㆍ·/"
 
 
 def _cell_label(text: str, start: int) -> str:
-    """숫자 앞의 '같은 칸 라벨'만 잘라낸다.
+    """숫자 앞에서 '이 칸을 설명하는 가장 가까운 라벨'을 찾는다.
 
-    표는 '라벨 숫자 라벨 숫자 …' 로 이어지므로, 바로 앞 숫자 뒤의 텍스트가 이 칸의 라벨이다.
-    고정 폭으로 앞을 보면 옆 칸(금액 칸 옆의 주식 수 칸 등)까지 들어와 오판한다.
+    표는 '라벨 숫자 숫자 …' 로 이어지는데, 한 행에서 같은 값이 반복되거나 '-' 로 비어 있는
+    칸이 섞인다. 바로 앞 숫자 뒤만 보면 그 구간에 글자가 없어 라벨을 놓친다.
+    (실측: '보통주식 1,625,769 0.2 92,683 - - - 1,625,769' 에서 두 번째 값이
+     주식 수인데 '약 1.63조원' 으로 환산됐다.)
+    그래서 숫자·구분자는 건너뛰고 글자가 나오는 가장 가까운 지점까지 거슬러 본다.
     """
     window = text[max(0, start - _CELL_LABEL_WINDOW):start]
-    last_digit = max((window.rfind(d) for d in "0123456789"), default=-1)
-    return window[last_digit + 1:]
+    idx = None
+    for m in _LABEL_CHAR.finditer(window):
+        idx = m.start()
+    if idx is None:
+        return window
+    while idx > 0 and (_LABEL_CHAR.match(window[idx - 1]) or window[idx - 1] in _LABEL_JOINER):
+        idx -= 1
+    return window[idx:]
 
 
 def annotate_amounts(text: str) -> str:
