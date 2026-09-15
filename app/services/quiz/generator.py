@@ -172,24 +172,7 @@ MC_PROMPT = ChatPromptTemplate.from_template("""
 """ + QUALITY_RULES + """
 """ + MC_QUALITY_RULES + """
 - 해설은 정답이 왜 맞고 오답이 왜 틀린지 설명하세요.
-""" + ANGLE_BLOCK + """
-참고용 예시 (형식만 보세요):
-{{
-  "question_text": "OOO에 대한 설명으로 옳은 것은?",
-  "choices": [
-    {{"no": 1, "text": "선택지 내용 (4개를 모두 채웁니다)"}},
-    {{"no": 2, "text": "선택지 내용"}},
-    {{"no": 3, "text": "선택지 내용"}},
-    {{"no": 4, "text": "선택지 내용"}}
-  ],
-  "correct_no": 아래에 지시된 정답 번호,
-  "explanation": "정답이 왜 맞는지, 오답이 왜 틀렸는지 설명합니다.",
-  "topic": "{topic}"
-}}
-
-⚠️ 위 예시는 **JSON 구조만** 보여주는 것입니다.
-반드시 "{topic}" 주제로 출제하세요. 다른 지표나 개념으로 새지 마세요.
-""" + ANSWER_POSITION_BLOCK + """
+""" + ANGLE_BLOCK + ANSWER_POSITION_BLOCK + """
 JSON 형식:
 {{
   "question_text": "문제 내용 (한 문장)",
