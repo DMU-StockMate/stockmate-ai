@@ -119,10 +119,60 @@ _LOW_INFO_REPORT_KEYWORDS = (
 )
 
 
+# 내용이 아직 정해지지 않았다고 스스로 밝힌 공시. 본문은 "현재 결정된 바 없습니다" 수준이라
+# 실질 정보가 없는데, 대형주에서 거의 매주 나온다.
+_UNDECIDED_MARK = "(미확정)"
+
+
 def is_low_info_report(title: str) -> bool:
     """공시 보고서명이 저정보 유형인지 판정한다 (공백 제거 후 부분일치)."""
     compact = re.sub(r"\s+", "", title or "")
-    return any(re.sub(r"\s+", "", kw) in compact for kw in _LOW_INFO_REPORT_KEYWORDS)
+    if any(re.sub(r"\s+", "", kw) in compact for kw in _LOW_INFO_REPORT_KEYWORDS):
+        return True
+    # "…에대한답변(미확정)", "풍문또는보도에대한해명(미확정)" 류
+    if _UNDECIDED_MARK in compact:
+        return True
+    # 거래소가 해명을 '요구'한 사실만 알리는 공시. 답변이 아니라 요구라 내용이 없다.
+    if "조회공시요구" in compact and "답변" not in compact:
+        return True
+    return False
+
+
+# 투자 판단에 직접 영향을 주는 공시 유형.
+# 최신순만으로 뽑으면 매일 나오는 형식적 공시에 밀려 탈락한다.
+# (실측: SK하이닉스 "중요한 공시" 질의에서 채택 5건이 전부 조회공시·풍문해명 계열이었고,
+#  연결재무제표기준영업(잠정)실적은 유사도가 후보 12건 중 꼴찌(0.606)라 점수순으로 뽑아도
+#  탈락했다. 최신성도 유사도도 '중요한가'를 모르기 때문에 유형으로 직접 표시한다.)
+# 목록에 없는 유형은 버려지는 게 아니라 일반 계층으로 내려갈 뿐이다.
+_KEY_REPORT_KEYWORDS = (
+    # 실적·정기보고서
+    "잠정실적", "영업(잠정)실적", "매출액또는손익구조",
+    "사업보고서", "반기보고서", "분기보고서",
+    # 자본 변동
+    "유상증자", "무상증자", "유상감자", "무상감자",
+    "전환사채", "신주인수권부사채", "교환사채",
+    "자기주식", "주식소각",
+    # 지배구조·구조 변경
+    "합병", "분할", "영업양수", "영업양도", "주식교환", "주식이전", "최대주주변경",
+    # 영업·투자
+    "공급계약", "단일판매", "신규시설투자", "타법인주식",
+    # 주주환원
+    "배당",
+    # 위험 신호
+    "중대재해", "횡령", "배임", "소송", "회생절차", "파산", "상장폐지", "관리종목",
+    "감사의견", "영업정지",
+)
+
+
+def is_key_report(title: str) -> bool:
+    """공시 보고서명이 투자 판단에 직접 영향을 주는 유형인지 판정한다.
+
+    저정보 판정이 우선이다 (예: "[기재정정]임원ㆍ주요주주특정증권등소유상황보고서").
+    """
+    compact = re.sub(r"\s+", "", title or "")
+    if is_low_info_report(compact):
+        return False
+    return any(re.sub(r"\s+", "", kw) in compact for kw in _KEY_REPORT_KEYWORDS)
 
 
 def format_krw_human(amount: int | str) -> str:
