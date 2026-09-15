@@ -45,6 +45,8 @@ RAG_PROMPT = ChatPromptTemplate.from_messages([
   자료로 확인되지 않으면 "제공된 자료에서는 확인되지 않습니다"라고 솔직하게 말하세요.
 - 각 자료 앞의 [출처 날짜] 표시(예: [뉴스 2026-07-15], [공시 2026-07-10], [재무])를 활용해
   더 최근 정보를 우선하고, 내용을 인용할 때 날짜·출처를 함께 밝히세요.
+- '오래된 자료' 표시가 붙은 항목은 최근 자료가 없어 기간을 넓혀 찾은 것입니다.
+  최신 소식으로 단정하지 말고 언제 자료인지 분명히 밝혀 설명하세요.
 - 참고 자료에 담긴 구체적 사실(처분 주식 수·금액·기간, 지분 변동, 실적 수치, 날짜 등)을
   빠뜨리지 말고 인용해 충실히 설명하세요. "여러 공시를 통해 정보를 제공합니다" 같은 막연한
   요약이나 일반론으로 끝내지 마세요.
@@ -155,7 +157,14 @@ def _ticker_condition(tickers: list[str]) -> FieldCondition:
 #   최신이라도 컨텍스트에서 제외한다. 유사도 낮은 문서가 섞여 할루시네이션을 유발하는 걸 막는다.
 #   (환경/데이터에 따라 튜닝 필요 — 우선 보수적으로 낮게 잡음)
 _SOURCE_SEARCH_CONFIG = {
-    "naver_news": {"cutoff_days": 7, "pool": 8, "take": 2, "min_score": 0.3},
+    # fallback_cutoff_days: 기본 창에서 후보가 0건일 때만 넓혀서 다시 찾는다.
+    # 적재는 "최신 10건"을 무조건 가져오는데 검색 창은 7일이라, 뉴스가 뜸한 종목은
+    # 적재한 10건이 전부 창 밖이라 후보가 0건이 된다
+    # (실측: 한국주철관공업 10건 적재, 날짜 2026-03-31~08-07, 7일 내 0건).
+    # take 2 -> 4: 대형주는 7일 안에도 후보가 충분한데(SK하이닉스 13건) 2건만 들어가
+    # 투자 관점에서 더 중요한 기사가 잘렸다.
+    "naver_news": {"cutoff_days": 7, "fallback_cutoff_days": 90,
+                   "pool": 8, "take": 4, "min_score": 0.3},
     # 공시는 "공시 내용 알려줘" 같은 질문에 여러 건을 자세히 다뤄야 해서 take를 넉넉히 둔다.
     "dart": {"cutoff_days": 90, "pool": 12, "take": 5, "min_score": 0.3},
     "dart_financials": {"cutoff_days": 730, "pool": 4, "take": 2, "min_score": 0.2},
@@ -200,6 +209,49 @@ def _order_for_take(items: list, source: str, get_content, get_published) -> lis
     return primary + demoted
 
 
+def _window_filter(tickers: list[str], source: str, cutoff_days: int) -> Filter:
+    cutoff = int((datetime.now() - timedelta(days=cutoff_days)).strftime("%Y%m%d"))
+    return Filter(must=[
+        _ticker_condition(tickers),
+        FieldCondition(key="metadata.source", match=MatchValue(value=source)),
+        FieldCondition(key="metadata.published_at", range=Range(gte=cutoff)),
+    ])
+
+
+async def _search_window(vs, question: str, tickers: list[str], source: str,
+                         cfg: dict, cutoff_days: int) -> list:
+    """한 기간 창 안에서만 유사도 검색해 (문서, 점수) 목록을 돌려준다."""
+    try:
+        return await vs.asimilarity_search_with_score(
+            question, k=cfg["pool"], filter=_window_filter(tickers, source, cutoff_days),
+        )
+    except Exception as e:
+        logger.error(f"소스별 검색 실패 [{source}]: {e}")
+        return []
+
+
+async def _search_with_fallback(vs, question: str, tickers: list[str], source: str,
+                                cfg: dict) -> tuple[list, bool]:
+    """기본 창에서 아무것도 못 찾으면 넓은 창으로 한 번 더 찾는다.
+
+    대형주의 신선도는 그대로 두고 뉴스가 뜸한 종목만 구제하기 위해, 넓히는 건 후보가
+    0건일 때뿐이다. 넓혀서 찾았는지 여부를 함께 돌려주어 프롬프트에서 '오래된 자료'로
+    표시할 수 있게 한다 - 표시 없이 넣으면 모델이 두 달 전 기사를 오늘 소식처럼 말한다.
+    """
+    results = await _search_window(vs, question, tickers, source, cfg, cfg["cutoff_days"])
+    fallback = cfg.get("fallback_cutoff_days")
+    if results or not fallback:
+        return results, False
+
+    results = await _search_window(vs, question, tickers, source, cfg, fallback)
+    if results:
+        logger.info(
+            f"[{source}] 최근 {cfg['cutoff_days']}일 내 자료가 없어 "
+            f"{fallback}일로 넓혀 {len(results)}건 찾음"
+        )
+    return results, bool(results)
+
+
 async def _search_source(vs, question: str, tickers: list[str], source: str, cfg: dict) -> list:
     """특정 source(news/dart/financials) 안에서만 유사도 검색 후 최신순으로 재정렬한다.
 
@@ -212,25 +264,14 @@ async def _search_source(vs, question: str, tickers: list[str], source: str, cfg
     그래서 source별로 유사도 상위 `pool`개를 먼저 뽑고, 그 안에서 published_at 내림차순으로
     재정렬해 상위 `take`개만 채택하는 2단계 방식으로 바꿨다 — 관련성(유사도)과 최신성을 분리해서 보장.
     """
-    now = datetime.now()
-    cutoff = int((now - timedelta(days=cfg["cutoff_days"])).strftime("%Y%m%d"))
-    source_filter = Filter(must=[
-        _ticker_condition(tickers),
-        FieldCondition(key="metadata.source", match=MatchValue(value=source)),
-        FieldCondition(key="metadata.published_at", range=Range(gte=cutoff)),
-    ])
-
-    try:
-        results = await vs.asimilarity_search_with_score(
-            question, k=cfg["pool"], filter=source_filter,
-        )
-    except Exception as e:
-        logger.error(f"소스별 검색 실패 [{source}]: {e}")
-        return []
+    results, widened = await _search_with_fallback(vs, question, tickers, source, cfg)
 
     # 유사도 임계값 미만 문서는 버린다 (관련성 없는 문서가 최신순 정렬로 채택되는 것 방지).
     min_score = cfg.get("min_score", 0.0)
     docs = [doc for doc, score in results if score >= min_score]
+    if widened:
+        for doc in docs:
+            doc.metadata = {**doc.metadata, "widened": True}
     # 관련성 통과분을 채택 순서(dart는 중요도 계층 → 최신순)로 정렬 후 상위 take개 채택.
     ordered = _order_for_take(
         docs, source,
@@ -270,21 +311,7 @@ async def _search_source_debug(vs, question: str, tickers: list[str], source: st
     """_search_source와 동일한 검색을 하되, 디버깅용으로 각 후보의 score/날짜/채택여부를
     그대로 노출한다. (실제 답변 경로는 score를 버려서 '무엇이 왜 뽑혔는지'가 안 보였음)
     """
-    now = datetime.now()
-    cutoff = int((now - timedelta(days=cfg["cutoff_days"])).strftime("%Y%m%d"))
-    source_filter = Filter(must=[
-        _ticker_condition(tickers),
-        FieldCondition(key="metadata.source", match=MatchValue(value=source)),
-        FieldCondition(key="metadata.published_at", range=Range(gte=cutoff)),
-    ])
-
-    try:
-        results = await vs.asimilarity_search_with_score(
-            question, k=cfg["pool"], filter=source_filter,
-        )
-    except Exception as e:
-        logger.error(f"소스별 디버그 검색 실패 [{source}]: {e}")
-        return []
+    results, widened = await _search_with_fallback(vs, question, tickers, source, cfg)
 
     min_score = cfg.get("min_score", 0.0)
     records = []
@@ -295,6 +322,8 @@ async def _search_source_debug(vs, question: str, tickers: list[str], source: st
             "published_at": doc.metadata.get("published_at"),
             "passed_score": float(score) >= min_score,
             "taken": False,
+            # 기본 창에 자료가 없어 넓힌 결과인지. 프롬프트에 '오래된 자료'로 표시된다.
+            "widened": widened,
             # 저정보 공시로 분류돼 후순위로 밀렸는지. 왜 안 뽑혔는지 디버깅용.
             "low_info": source == "dart" and _is_low_info_dart(doc.page_content),
             "content": doc.page_content,
@@ -355,7 +384,8 @@ def _format_docs(docs) -> str:
         source = doc.metadata.get("source")
         label = _SOURCE_LABEL.get(source, "자료")
         date_str = _fmt_published_at(doc.metadata.get("published_at"))
-        header = f"[{label} {date_str}]" if date_str else f"[{label}]"
+        marks = [m for m in (date_str, "오래된 자료" if doc.metadata.get("widened") else "") if m]
+        header = f"[{label} {' · '.join(marks)}]" if marks else f"[{label}]"
         content = doc.page_content
         cap = _DOC_CHAR_CAP.get(source, _DEFAULT_DOC_CAP)
         if len(content) > cap:
