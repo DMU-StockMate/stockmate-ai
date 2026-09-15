@@ -40,7 +40,8 @@ RAG_PROMPT = ChatPromptTemplate.from_messages([
 사용자 수준: {level_guide}
 
 답변 시 다음을 지켜주세요:
-- 답변은 반드시 한국어로만 작성하세요.
+- 답변은 반드시 한국어로만 작성하세요. 한자나 일본어 문자를 절대 쓰지 마세요.
+  (숫자, 그리고 PER·EPS 같은 지표 약어는 그대로 써도 됩니다.)
 - 참고 자료에 있는 내용만 근거로 삼고, 자료에 없는 내용은 추측하거나 지어내지 마세요.
   자료로 확인되지 않으면 "제공된 자료에서는 확인되지 않습니다"라고 솔직하게 말하세요.
 - 각 자료 앞의 [출처 날짜] 표시(예: [뉴스 2026-07-15], [공시 2026-07-10], [재무])를 활용해
@@ -55,10 +56,13 @@ RAG_PROMPT = ChatPromptTemplate.from_messages([
   "무슨 공시인지 · 핵심 수치(주식 수·금액·지분율 등) · 배경이나 의미"를 구체적으로 설명하세요.
 - 긍정적/부정적 요인을 구분해서 객관적으로 설명해주세요.
 - 매수/매도 같은 직접적인 투자 판단은 하지 마세요.
-- 면책 문구는 마지막에 한 번만 간략하게 언급하세요.
+- 면책 문구는 쓰지 마세요. 서버가 답변 끝에 붙입니다.
 - 금액 단위(조원/억원)는 참고 자료에 이미 변환되어 있으면 그 값을 그대로 인용하세요.
   직접 조/억 단위로 재계산하지 마세요 — 자릿수를 잘못 세면 실제 금액과 크게 어긋납니다.
 - 서로 다른 항목(예: 매출액 증감과 자산 증감)의 수치를 섞어서 인용하지 마세요.
+- 계산식은 수식 기호 없이 한국어 문장으로 쓰세요.
+  달러 기호($)나 역슬래시 명령(\\frac, \\text 등)은 화면에 그대로 노출됩니다.
+  (좋은 예: "PER은 주가를 주당순이익으로 나눈 값입니다")
 
 [참고 자료]
 {context}"""),
@@ -74,7 +78,11 @@ GENERAL_PROMPT = ChatPromptTemplate.from_messages([
 사용자 수준: {level_guide}
 
 답변 시 다음을 지켜주세요:
-- 답변은 반드시 한국어로만 작성하세요.
+- 답변은 반드시 한국어로만 작성하세요. 한자나 일본어 문자를 절대 쓰지 마세요.
+  (숫자, 그리고 PER·EPS 같은 지표 약어는 그대로 써도 됩니다.)
+- 계산식은 수식 기호 없이 한국어 문장으로 쓰세요.
+  달러 기호($)나 역슬래시 명령(\\frac, \\text 등)은 화면에 그대로 노출됩니다.
+  (좋은 예: "PER은 주가를 주당순이익으로 나눈 값입니다")
 - 투자 판단은 사용자 본인이 하도록 안내하세요.
 - 실시간 시세, 특정 종목의 최근 뉴스·실적처럼 최신 정보가 필요한 질문에는 단정하지 말고,
   정확한 최신 수치는 확인이 필요하다고 안내하세요. 기억에 의존해 특정 수치나 날짜를 지어내지 마세요."""),
@@ -105,6 +113,36 @@ QUIZ_PROMPT = ChatPromptTemplate.from_messages([
     MessagesPlaceholder(variable_name="history"),
     ("human", "{question}"),
 ])
+
+
+# 모델이 쓰던 면책 문구를 서버가 붙이는 고정 문장으로 대체한다.
+# 측정(2026-09-15, RAG 답변 20건): 한자 혼입 7건 중 5건이 이 면책 문구 자리였다.
+#   "투자 판단의 근거로直接使用하지 마시기 바랍니다"
+# 프롬프트에 "한국어로만 작성하세요"가 있는데도 샜다. 매번 새로 쓰게 할 이유가 없는
+# 정형 문장이므로 생성 대상에서 빼고 고정 문장을 붙인다 - 문구도 일관돼진다.
+RAG_DISCLAIMER = (
+    "\n\n---\n"
+    "이 답변은 제공된 뉴스·공시·재무 자료를 정리한 것이며 투자 권유가 아닙니다. "
+    "투자 판단과 그 결과는 투자자 본인에게 있습니다."
+)
+
+# 한자·가나. 한국 주식 설명에서 정당하게 쓰일 일이 없다.
+_CJK_LEAK = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff]")
+
+
+def _warn_if_not_korean(answer: str, where: str) -> None:
+    """한자·가나가 섞였으면 경고만 남긴다.
+
+    퀴즈는 assert_korean 으로 거절하고 재생성하지만, 채팅은 스트리밍이라 되돌릴 수 없고
+    답변 전체를 버리는 비용이 훨씬 크다. 대신 빈도를 로그로 드러내 추적 가능하게 한다.
+    """
+    m = _CJK_LEAK.search(answer or "")
+    if m:
+        i = m.start()
+        logger.warning(
+            f"{where} 답변에 한자/가나 혼입: {m.group()!r} "
+            f"(…{answer[max(0, i - 20):i + 20]}…)"
+        )
 
 
 def _get_llm():
@@ -426,13 +464,15 @@ async def run_rag_chain(question: str, tickers: list[str], history: list[Message
     if stock_context:
         context = f"{stock_context}\n\n{context}"
     chain = RAG_PROMPT | _get_llm() | StrOutputParser()
-    return await chain.ainvoke({
+    answer = await chain.ainvoke({
         "context": context,
         "history": _convert_history(history),
         "question": question,
         "today": _today_str(),
         "level_guide": _get_level_guide(investment_level),
     })
+    _warn_if_not_korean(answer, "RAG")
+    return answer.rstrip() + RAG_DISCLAIMER
 
 
 async def run_rag_evaluate(question: str, tickers: list[str], history: list[Message], investment_level: str = "미설정") -> dict:
@@ -456,6 +496,8 @@ async def run_rag_evaluate(question: str, tickers: list[str], history: list[Mess
         "today": _today_str(),
         "level_guide": _get_level_guide(investment_level),
     })
+    _warn_if_not_korean(answer, "RAG")
+    answer = answer.rstrip() + RAG_DISCLAIMER
 
     # score/날짜/채택여부가 담긴 상세 검색 기록 (답변과 동일 로직이라 taken 집합이 일치)
     retrieved = await debug_retrieve(question, tickers)
@@ -584,6 +626,7 @@ async def stream_rag_chain(question: str, tickers: list[str], history: list[Mess
     if stock_context:
         context = f"{stock_context}\n\n{context}"
     chain = RAG_PROMPT | _get_llm() | StrOutputParser()
+    parts: list[str] = []
     async for chunk in chain.astream({
         "context": context,
         "history": _convert_history(history),
@@ -591,7 +634,10 @@ async def stream_rag_chain(question: str, tickers: list[str], history: list[Mess
         "today": _today_str(),
         "level_guide": _get_level_guide(investment_level),
     }):
+        parts.append(chunk)
         yield chunk
+    _warn_if_not_korean("".join(parts), "RAG 스트리밍")
+    yield RAG_DISCLAIMER
 
 
 async def stream_general_chain(question: str, history: list[Message], investment_level: str = "미설정"):
