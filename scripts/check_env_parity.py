@@ -44,6 +44,13 @@ INTENTIONAL = {
     "APP_PORT", "HF_HOME",
 }
 
+# 로컬(OpenRouter)에서만 쓰는 설정. Dockerfile 에 **없는 것이 정상**이다.
+# 파드는 같은 컨테이너의 vLLM 만 보므로, 값을 넣어도 코드가 base_url 로 걸러
+# 발동하지 않는 죽은 값이 된다. INTENTIONAL(값이 달라도 정상)과는 다른 개념이다.
+LOCAL_ONLY = {
+    "LLM_OPENROUTER_QUANTIZATIONS", "LLM_OPENROUTER_ALLOW_FALLBACKS",
+}
+
 # 값 자체를 비교하면 안 되는 것들 (자격증명)
 SECRETS = {
     "AI_API_KEY", "LLM_API_KEY", "DART_API_KEY", "NAVER_CLIENT_ID",
@@ -149,7 +156,8 @@ def main() -> int:
     # config.py 에만 있는 설정 (템플릿 env 로 조정은 되지만 문서화가 안 된 것)
     undocumented = sorted(
         f for f in fields
-        if f.startswith(PREFIXES) and f not in docker and f not in SECRETS
+        if f.startswith(PREFIXES) and f not in docker
+        and f not in SECRETS and f not in LOCAL_ONLY
     )
     if undocumented:
         print("\n[참고] config.py 에만 있고 Dockerfile ENV 에 없는 설정:")
@@ -157,6 +165,13 @@ def main() -> int:
         print("  pydantic-settings 는 선언 여부와 무관하게 환경변수를 읽으므로")
         print("  파드 템플릿 env 로 조정은 된다. 다만 기본값이 코드에만 있어")
         print("  '서버에서 무슨 값으로 도는지' 를 Dockerfile 만 봐서는 알 수 없다.")
+
+    local_only = sorted(f for f in fields if f in LOCAL_ONLY)
+    if local_only:
+        print("\n[로컬 전용] Dockerfile 에 없는 것이 정상인 설정:")
+        print("  " + ", ".join(local_only))
+        print("  파드는 같은 컨테이너의 vLLM 만 보므로 서버에서는 발동하지 않는다.")
+        print("  Dockerfile 에 적으면 읽히지만 쓰이지 않는 죽은 값이 된다.")
 
     print("\n" + "=" * 60)
     if problems:

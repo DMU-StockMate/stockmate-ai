@@ -465,6 +465,7 @@ Invoke-RestMethod "https://api.runpod.io/v2/pods/<POD_ID>" -Method Delete -Heade
 | 파이썬 패키지 추가 (`uv add ...`) | **`requirements-server.txt` 에도 추가** |
 | `.env` 에서 튜닝 값 변경 | **`Dockerfile` ENV + `.env.example` 에도 반영** |
 | 설정 항목 추가 (`config.py`) | 위와 같음 — 네 곳(`config.py` / `.env` / `Dockerfile` / `.env.example`) |
+| 로컬에서만 쓰는 설정 추가 | **Dockerfile 은 뺀다.** 파드에서 발동하지 않는 죽은 값이 된다. `check_env_parity.py` 의 `LOCAL_ONLY` 에 등록할 것 (예: `LLM_OPENROUTER_*`) |
 | API 키 재발급 | RunPod 템플릿 `c3bqwiolqi` 의 env 도 갱신 |
 
 패키지 누락은 Dockerfile 끝의 `import app.main` 게이트가 빌드에서 잡아준다
