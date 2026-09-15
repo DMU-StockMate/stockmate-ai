@@ -10,7 +10,7 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny, R
 from app.services.rag.vectorstore import get_vectorstore
 from app.services.rag.ticker_extractor import extract_tickers
 from app.services.external.kis import get_stocks_info
-from app.services.external.dart import is_low_info_report
+from app.services.external.dart import is_key_report, is_low_info_report
 from app.core.config import settings
 from app.schemas.chat import Message, QuizContext
 from app.core.logger import setup_logger
@@ -189,10 +189,21 @@ def _is_low_info_dart(content: str) -> bool:
     return is_low_info_report(_dart_title(content))
 
 
+def _dart_tier(content: str) -> int:
+    """공시 채택 우선순위. 0 = 중요, 1 = 일반, 2 = 저정보."""
+    title = _dart_title(content)
+    if is_low_info_report(title):
+        return 2
+    return 0 if is_key_report(title) else 1
+
+
 def _order_for_take(items: list, source: str, get_content, get_published) -> list:
     """관련성 통과분을 '채택 순서'로 정렬한다.
 
-    dart 는 핵심 공시 → 저정보 공시 2계층으로 나눈 뒤 각 계층 안에서 최신순으로 본다.
+    dart 는 중요 → 일반 → 저정보 3계층으로 나눈 뒤 각 계층 안에서 최신순으로 본다.
+    2계층(핵심/저정보)만 두었을 때는, 저정보로 분류되지 않는 형식적 공시(조회공시요구 등)가
+    최신이라는 이유만으로 잠정실적·중대재해를 밀어냈다. 중요도를 표현하는 신호가 없으면
+    최신성이 그 자리를 대신 차지한다.
     나머지 source(뉴스/재무)는 유형별 중요도 편차가 없으므로 기존대로 최신순만 본다.
     """
     def recency(x):
@@ -201,12 +212,13 @@ def _order_for_take(items: list, source: str, get_content, get_published) -> lis
     if source != "dart":
         return sorted(items, key=recency, reverse=True)
 
-    primary, demoted = [], []
+    tiers: dict[int, list] = {0: [], 1: [], 2: []}
     for x in items:
-        (demoted if _is_low_info_dart(get_content(x)) else primary).append(x)
-    primary.sort(key=recency, reverse=True)
-    demoted.sort(key=recency, reverse=True)
-    return primary + demoted
+        tiers[_dart_tier(get_content(x))].append(x)
+    ordered = []
+    for tier in (0, 1, 2):
+        ordered.extend(sorted(tiers[tier], key=recency, reverse=True))
+    return ordered
 
 
 def _window_filter(tickers: list[str], source: str, cutoff_days: int) -> Filter:
@@ -326,6 +338,9 @@ async def _search_source_debug(vs, question: str, tickers: list[str], source: st
             "widened": widened,
             # 저정보 공시로 분류돼 후순위로 밀렸는지. 왜 안 뽑혔는지 디버깅용.
             "low_info": source == "dart" and _is_low_info_dart(doc.page_content),
+            # 채택 계층: key(중요) / normal(일반) / low_info(저정보). dart 만 해당.
+            "tier": ("key", "normal", "low_info")[_dart_tier(doc.page_content)]
+            if source == "dart" else "",
             "content": doc.page_content,
         })
 
