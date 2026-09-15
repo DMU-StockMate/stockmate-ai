@@ -12,12 +12,33 @@ KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 _token: str | None = None
 _token_expired_at: datetime | None = None
 
+# 토큰이 없는 상태에서 동시 요청이 들어오면 저마다 발급을 시도한다.
+# KIS 는 토큰 발급 자체에 빈도 제한이 있어 그 요청들이 403 으로 떨어진다
+# (2026-09-15 실측: 동시 5건으로 채팅을 돌리자 전부 403 Forbidden -> 시세 누락).
+# 서버 기동 직후 사용자가 몰리면 그대로 재현되는 경로다.
+# 락으로 한 번만 발급하고 나머지는 그 결과를 기다린다.
+_token_lock = asyncio.Lock()
+
+
+def _token_valid() -> bool:
+    return bool(_token and _token_expired_at and datetime.now() < _token_expired_at)
+
 
 async def _get_access_token() -> str:
     global _token, _token_expired_at
 
-    if _token and _token_expired_at and datetime.now() < _token_expired_at:
+    if _token_valid():
         return _token
+
+    async with _token_lock:
+        # 락을 기다리는 사이 다른 요청이 이미 발급했을 수 있다.
+        if _token_valid():
+            return _token
+        return await _issue_access_token()
+
+
+async def _issue_access_token() -> str:
+    global _token, _token_expired_at
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
