@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     # 파드는 Qwen3.8-27B-FP8 이므로 로컬도 fp8 로 맞춰 측정을 재현 가능하게 한다.
     # 주의: "파드와 같은 출력"이 되는 게 아니라 "매번 같은 조건"이 되는 것뿐이다.
     # LLM_BASE_URL 이 openrouter.ai 일 때만 요청에 실린다 (vLLM 에는 나가지 않는다).
+    #
+    # **Dockerfile ENV 에는 넣지 않는다.** 파드는 같은 컨테이너의 vLLM 만 보므로
+    # 값을 넣어도 코드가 base_url 로 걸러 발동하지 않는 죽은 값이 된다.
+    # "설정을 추가하면 네 곳을 같이 고쳐라" 규칙의 예외이며,
+    # check_env_parity.py 의 LOCAL_ONLY 가 그 예외를 지킨다.
     LLM_OPENROUTER_QUANTIZATIONS: str = "fp8"
     # 지정한 양자화를 서빙하는 곳이 없을 때 다른 정밀도로 흘러가도 되는지.
     # False 면 실패한다 - 모르는 사이 fp4 로 재는 것보다 낫다.
