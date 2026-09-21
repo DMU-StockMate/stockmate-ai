@@ -14,6 +14,7 @@ from app.services.external.dart import is_key_report, is_low_info_report
 from app.core.config import settings
 from app.schemas.chat import Message, QuizContext
 from app.core.logger import setup_logger
+from app.services.site.guide import load_site_guide
 logger = setup_logger(__name__)
 
 # Qdrant 문서 source → 사람이 읽는 라벨. 컨텍스트에 붙여 LLM이 뉴스/공시/재무를 구분하고
@@ -33,7 +34,7 @@ LEVEL_GUIDE = {
 }
 
 RAG_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """당신은 친절하고 전문적인 주식 투자 코치입니다.
+    ("system", """당신은 주식 투자 학습 사이트 StockMate 의 친절하고 전문적인 주식 투자 코치입니다.
 아래 참고 자료를 바탕으로 사용자의 질문에 답변해주세요.
 
 오늘 날짜: {today}
@@ -71,7 +72,7 @@ RAG_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 GENERAL_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """당신은 친절하고 전문적인 주식 투자 코치입니다.
+    ("system", """당신은 주식 투자 학습 사이트 StockMate 의 친절하고 전문적인 주식 투자 코치입니다.
 주식 투자와 관련된 질문에 성실하게 답변해주세요.
 
 오늘 날짜: {today}
@@ -85,7 +86,41 @@ GENERAL_PROMPT = ChatPromptTemplate.from_messages([
   (좋은 예: "PER은 주가를 주당순이익으로 나눈 값입니다")
 - 투자 판단은 사용자 본인이 하도록 안내하세요.
 - 실시간 시세, 특정 종목의 최근 뉴스·실적처럼 최신 정보가 필요한 질문에는 단정하지 말고,
-  정확한 최신 수치는 확인이 필요하다고 안내하세요. 기억에 의존해 특정 수치나 날짜를 지어내지 마세요."""),
+  정확한 최신 수치는 확인이 필요하다고 안내하세요. 기억에 의존해 특정 수치나 날짜를 지어내지 마세요.
+- StockMate 사이트의 기능이나 규칙(모의투자 자금, 보상, 메뉴 등)은 추측해서 말하지 마세요."""),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "{question}"),
+])
+
+# 사이트 질문용. 일반 프롬프트의 규칙을 모두 포함한 상위 집합이다 - 판별이 신호어 기반이라
+# 일반 투자 질문이 이리 올 수 있고, 그때도 일반 갈래와 같은 품질로 답해야 한다.
+# 안내서는 system 끝에 둔다. 앞부분(역할·규칙)이 매번 같아 vLLM prefix caching 을 탄다.
+SITE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """당신은 주식 투자 학습 사이트 StockMate 의 친절하고 전문적인 주식 투자 코치입니다.
+사용자는 지금 StockMate 의 'AI 분석' 채팅에서 질문하고 있습니다.
+
+오늘 날짜: {today}
+사용자 수준: {level_guide}
+
+답변 시 다음을 지켜주세요:
+- 답변은 반드시 한국어로만 작성하세요. 한자나 일본어 문자를 절대 쓰지 마세요.
+  (숫자, 그리고 PER·EPS 같은 지표 약어는 그대로 써도 됩니다.)
+- StockMate 의 기능·메뉴·규칙(모의투자, 퀴즈 보상, 등급, 랭킹, 커뮤니티, 계정 등)에 대한 질문은
+  아래 [StockMate 안내서]에 적힌 내용만 근거로 답하세요.
+  - 안내서에 없는 기능이나 수치는 지어내지 마세요. "안내서에서 확인되지 않는다"고 말하고,
+    확인할 수 있는 메뉴가 있으면 알려주세요.
+  - 다른 서비스(증권사 앱, 네이버 등)의 방식으로 답하지 마세요. 사용자는 StockMate 를 쓰고 있습니다.
+  - 어디서 하는지 물으면 "투자학습 → 개인 맞춤"처럼 메뉴 경로로 알려주세요.
+  - 안내서에 '확인되지 않는다', '약속하지 말라'고 적힌 항목은 단정하지 마세요.
+- 사이트와 무관한 일반 투자 질문이면 평소처럼 투자 지식으로 답하세요.
+- 계산식은 수식 기호 없이 한국어 문장으로 쓰세요.
+  달러 기호($)나 역슬래시 명령(\\frac, \\text 등)은 화면에 그대로 노출됩니다.
+- 투자 판단은 사용자 본인이 하도록 안내하세요.
+- 실시간 시세, 특정 종목의 최근 뉴스·실적처럼 최신 정보가 필요한 질문에는 단정하지 말고,
+  종목 이름을 넣어 다시 물어보면 최신 자료를 찾아 답할 수 있다고 안내하세요.
+
+[StockMate 안내서]
+{site_guide}"""),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{question}"),
 ])
@@ -520,6 +555,24 @@ async def run_general_chain(question: str, history: list[Message], investment_le
     })
 
 
+def _site_inputs(question: str, history: list[Message], investment_level: str) -> dict:
+    return {
+        "history": _convert_history(history),
+        "question": question,
+        "today": _today_str(),
+        "level_guide": _get_level_guide(investment_level),
+        "site_guide": load_site_guide(),
+    }
+
+
+async def run_site_chain(question: str, history: list[Message], investment_level: str = "미설정") -> str:
+    logger.info(f"사이트 체인 실행: {question[:30]}...")
+    chain = SITE_PROMPT | _get_llm() | StrOutputParser()
+    answer = await chain.ainvoke(_site_inputs(question, history, investment_level))
+    _warn_if_not_korean(answer, "사이트")
+    return answer
+
+
 async def _build_quiz_context(question: str, quiz_context: QuizContext) -> tuple[str, dict]:
     """quiz_context.category에 따라 추가 참고 자료를 조회해 프롬프트에 넣을 텍스트를 만든다.
 
@@ -684,3 +737,13 @@ async def stream_quiz_chain(
         "context": _format_quiz_context_block(extra_context),
     }):
         yield chunk
+
+
+async def stream_site_chain(question: str, history: list[Message], investment_level: str = "미설정"):
+    logger.info(f"사이트 스트리밍: {question[:30]}...")
+    chain = SITE_PROMPT | _get_llm() | StrOutputParser()
+    parts: list[str] = []
+    async for chunk in chain.astream(_site_inputs(question, history, investment_level)):
+        parts.append(chunk)
+        yield chunk
+    _warn_if_not_korean("".join(parts), "사이트 스트리밍")
