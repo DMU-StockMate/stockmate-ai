@@ -9,8 +9,10 @@ from app.services.rag.ingestion import ingest_news, ingest_disclosures, ingest_f
 from app.services.rag.chain import (
     run_rag_chain, run_general_chain, run_quiz_chain, run_rag_evaluate,
     stream_rag_chain, stream_general_chain, stream_quiz_chain,
+    run_site_chain, stream_site_chain,
 )
 from app.services.rag.ticker_extractor import extract_tickers, extract_tickers_from_history
+from app.services.site.guide import is_site_question, is_site_followup
 from app.core.logger import setup_logger
 from app.core.keepalive import json_with_keepalive
 
@@ -29,6 +31,30 @@ _HEARTBEAT_INTERVAL_SEC = 10.0
 # SSE 주석. EventSource 는 ':' 로 시작하는 줄을 자동으로 무시하므로
 # 클라이언트 변경 없이 연결만 살려둔다.
 _SSE_KEEPALIVE = ": keepalive\n\n"
+
+
+def _route(question: str, history: list) -> tuple[str, list[str]]:
+    """일반 채팅의 갈래를 정한다. ("site" | "rag" | "general", tickers)
+
+    1. 사이트 신호어가 있으면 사이트 갈래. **종목 추출보다 먼저 본다** - 종목 추출기가 퍼지 매칭이라
+       "커뮤니티에 글 어떻게 써?"를 '엔써커뮤니티'로 잡아 공시 RAG 로 보내고 있었다.
+    2. 현재 질문에 종목이 있으면 RAG.
+    3. 신호어 없는 후속 질문("그럼 그건 어디서 봐?")은 직전 사용자 질문을 따른다.
+       사이트 질문이었으면 사이트, 아니면 대화 기록의 종목으로 RAG.
+    4. 나머지는 일반.
+    """
+    if is_site_question(question):
+        return "site", []
+    tickers = extract_tickers(question)
+    if tickers:
+        return "rag", tickers
+    if history:
+        if is_site_followup(history):
+            return "site", []
+        tickers = extract_tickers_from_history(history)
+        if tickers:
+            return "rag", tickers
+    return "general", []
 
 
 async def _ingest_all_sources(tickers: list[str]) -> dict:
@@ -183,7 +209,8 @@ error (에러 발생 시):
 ---
 
 **일반 채팅 (quiz_context: null)**
-- 질문에서 종목명 자동 추출
+- 사이트(StockMate) 기능·메뉴·규칙 질문이면 사이트 안내서 기반 답변 (meta.tickers 는 빈 배열)
+- 아니면 질문에서 종목명 자동 추출
 - 종목 있으면 뉴스/공시 기반 RAG 답변
 - 종목 없으면 LLM 직접 답변
 - investment_level에 맞게 답변 난이도 조절
@@ -232,17 +259,20 @@ async def chat_stream(req: ChatStreamRequest):
                     yield event
 
             else:
-                tickers = extract_tickers(req.question)
-                if not tickers and req.history:
-                    tickers = extract_tickers_from_history(req.history)
+                mode, tickers = _route(req.question, req.history)
 
                 ingested = {}
                 yield f"data: {json.dumps({'type': 'meta', 'tickers': tickers, 'timestamp': started_at}, ensure_ascii=False)}\n\n"
 
-                if tickers:
+                if mode == "rag":
                     ingested = await _ingest_all_sources(tickers)
                     async for event in _token_events(stream_rag_chain(
                         req.question, tickers, req.history, investment_level
+                    )):
+                        yield event
+                elif mode == "site":
+                    async for event in _token_events(stream_site_chain(
+                        req.question, req.history, investment_level
                     )):
                         yield event
                 else:
@@ -265,14 +295,14 @@ async def chat_stream(req: ChatStreamRequest):
 
 @router.post("/ask", response_model=AskResponse, include_in_schema=False)
 async def ask(req: AskRequest):
-    tickers = extract_tickers(req.question)
-    if not tickers and req.history:
-        tickers = extract_tickers_from_history(req.history)
+    mode, tickers = _route(req.question, req.history)
 
     ingested = {}
-    if tickers:
+    if mode == "rag":
         ingested = await _ingest_all_sources(tickers)
         answer = await run_rag_chain(req.question, tickers, req.history)
+    elif mode == "site":
+        answer = await run_site_chain(req.question, req.history)
     else:
         answer = await run_general_chain(req.question, req.history)
 
@@ -293,7 +323,7 @@ async def ask(req: AskRequest):
 
 **응답 필드**
 - `tickers`: 추출된 종목
-- `mode`: "rag" | "general" (종목 없으면 general)
+- `mode`: "site" | "rag" | "general" (사이트 질문이면 site, 종목 없으면 general)
 - `ingested`: 이번 호출에 적재된 뉴스/공시/재무 건수
 - `answer`: 최종 답변(비스트리밍)
 - `stock_data`: KIS 실시간 시세/지표
@@ -312,15 +342,14 @@ async def _chat_evaluate(req: ChatStreamRequest):
     # 실제 예외 메시지와 traceback을 그대로 반환한다(원인 파악용).
     try:
         investment_level = req.user.investment_level if req.user else "미설정"
-        tickers = extract_tickers(req.question)
-        if not tickers and req.history:
-            tickers = extract_tickers_from_history(req.history)
+        mode, tickers = _route(req.question, req.history)
 
-        if not tickers:
-            answer = await run_general_chain(req.question, req.history, investment_level)
+        if mode != "rag":
+            run = run_site_chain if mode == "site" else run_general_chain
+            answer = await run(req.question, req.history, investment_level)
             return {
                 "tickers": [],
-                "mode": "general",
+                "mode": mode,
                 "ingested": {},
                 "answer": answer,
                 "stock_data": {},
@@ -353,17 +382,20 @@ async def ask_stream(req: AskRequest):
         started_at = datetime.now().isoformat()
 
         try:
-            tickers = extract_tickers(req.question)
-            if not tickers and req.history:
-                tickers = extract_tickers_from_history(req.history)
+            mode, tickers = _route(req.question, req.history)
 
             ingested = {}
             yield f"data: {json.dumps({'type': 'meta', 'tickers': tickers, 'timestamp': started_at}, ensure_ascii=False)}\n\n"
 
-            if tickers:
+            if mode == "rag":
                 ingested = await _ingest_all_sources(tickers)
                 async for event in _token_events(
                     stream_rag_chain(req.question, tickers, req.history)
+                ):
+                    yield event
+            elif mode == "site":
+                async for event in _token_events(
+                    stream_site_chain(req.question, req.history)
                 ):
                     yield event
             else:
