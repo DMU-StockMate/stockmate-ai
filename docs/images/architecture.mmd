@@ -1,0 +1,27 @@
+%% README 구조도 원본. 수정 후 다시 렌더링한다:
+%% npx -p @mermaid-js/mermaid-cli mmdc -i architecture.mmd -o architecture.png -t neutral -b white -s 2
+flowchart LR
+    U["사용자"] --> F["Frontend<br>React"]
+    F --> B["Backend<br>NestJS · MySQL"]
+    B -- "X-API-Key<br>SSE / JSON" --> A
+
+    subgraph Pod["RunPod H100 80GB · 컨테이너 1개"]
+        direction TB
+        A["FastAPI<br>stockmate-ai"]
+        V["vLLM<br>Qwen3.8-27B FP8"]
+        Q[("Qdrant<br>뉴스 · 공시 · 재무<br>퀴즈 뱅크")]
+        E["bge-m3<br>임베딩"]
+        A --> V
+        A --> Q
+        A --> E
+    end
+
+    subgraph Ext["외부 API"]
+        direction TB
+        D["DART OpenAPI<br>공시 · 재무제표"]
+        N["네이버 뉴스 API"]
+        K["KIS API<br>실시간 시세"]
+        D ~~~ N ~~~ K
+    end
+
+    A --> Ext

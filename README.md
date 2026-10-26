@@ -75,26 +75,9 @@
 
 ## 2. 구조
 
-```mermaid
-flowchart LR
-    U[사용자] --> F[Frontend<br/>React]
-    F --> B[Backend<br/>NestJS · MySQL]
-    B -- "X-API-Key<br/>SSE / JSON" --> A
-
-    subgraph Pod["RunPod H100 80GB · 컨테이너 1개"]
-        A[FastAPI<br/>stockmate-ai]
-        V[vLLM<br/>Qwen3.8-27B FP8]
-        Q[(Qdrant<br/>뉴스·공시·재무<br/>퀴즈 뱅크)]
-        E[bge-m3<br/>임베딩]
-        A --> V
-        A --> Q
-        A --> E
-    end
-
-    A --> D[DART OpenAPI<br/>공시·재무제표]
-    A --> N[네이버 뉴스 API]
-    A --> K[KIS API<br/>실시간 시세]
-```
+<p align="center">
+  <img src="docs/images/architecture.png" alt="StockMate AI 구조도" width="100%">
+</p>
 
 - 글로 된 자료(뉴스, 공시 본문)는 Qdrant 에 넣고 의미 검색합니다.
 - 숫자(현재가, PER/PBR/EPS)는 벡터 DB 에 넣지 않고 그때그때 KIS API 로 받습니다. 숫자를 임베딩해 섞으면 검색 품질만 떨어지고, 시세는 어차피 금방 낡습니다.
@@ -108,7 +91,7 @@ flowchart LR
 |---|---|
 | API 서버 | Python 3.11, FastAPI, uvicorn, `uv` |
 | LLM 연동 | LangChain (`ChatOpenAI` / `ChatOllama`) |
-| LLM | Qwen3.8-27B FP8 (서버: vLLM, 로컬: OpenRouter 의 같은 모델) |
+| LLM | Qwen3.8-27B FP8 (vLLM) |
 | 임베딩 | BAAI/bge-m3 (`sentence-transformers`) |
 | 벡터 DB | Qdrant 1.18 |
 | 외부 데이터 | DART OpenAPI, 네이버 검색 API(뉴스), 한국투자증권 KIS API |
@@ -135,7 +118,7 @@ flowchart LR
 
 더 큰 모델(GLM-5.3-Flash, DeepSeek V4 등)도 검토했지만 GPU 를 여러 장 써야 해서 예산(베타 + 발표 합쳐 30시간 미만, 10~19만 원)을 몇 배 넘었습니다. 27B 는 FP8 로 28GB 라 H100 한 장에 올라가고 KV 캐시 자리도 50GB 가 남습니다. 예산선 안쪽에 걸린 유일한 선택지였습니다.
 
-이 과정은 유료 API 대신 오픈 웨이트 모델을 직접 서빙한다는 프로젝트 원칙 안에서 진행했습니다. 개발 중에는 GPU 를 계속 빌릴 수 없어서 OpenRouter 로 같은 모델을 호출하고, 양자화를 서버와 같은 fp8 로 고정해 측정이 흔들리지 않게 했습니다.
+이 과정은 유료 API 대신 오픈 웨이트 모델을 직접 서빙한다는 프로젝트 원칙 안에서 진행했습니다.
 
 ### vLLM, 그리고 컨테이너 하나
 
@@ -290,7 +273,7 @@ RunPod H100 80GB, 이미지 `0.1.7`, 프록시를 거친 실측입니다.
 
 ### 로컬
 
-필요한 것: Python 3.11, [uv](https://docs.astral.sh/uv/), Docker, 그리고 API 키(DART, 네이버 검색, KIS, OpenRouter).
+필요한 것: Python 3.11, [uv](https://docs.astral.sh/uv/), Docker, API 키(DART, 네이버 검색, KIS), 그리고 모델을 띄운 LLM 서버.
 
 ```bash
 git clone https://github.com/DMU-StockMate/stockmate-ai.git
@@ -309,7 +292,7 @@ uv run uvicorn app.main:app --reload
 
 - 순서가 중요합니다. Qdrant 보다 서버를 먼저 띄우면 연결 오류가 납니다. 서버는 기동하면서 DART 기업 코드 목록을 받고 임베딩 모델을 미리 올립니다.
 - 첫 기동 때 bge-m3(약 2GB)를 내려받습니다. 로컬에서는 `EMBEDDING_DEVICE=cpu` 로 충분합니다. 임베딩은 적재할 때와 짧은 질문 하나에만 쓰입니다.
-- OpenRouter 대신 Ollama 를 쓰려면 `LLM_BACKEND=ollama`, `LLM_MODEL=<모델명>` 으로 바꾸면 됩니다. LangChain 으로 감싸 두어서 코드는 그대로입니다.
+- LLM 서버는 `.env` 의 `LLM_BASE_URL`, `LLM_MODEL` 로 지정합니다. OpenAI 호환 API 를 여는 서버(vLLM, llama.cpp 의 `llama-server` 등)면 주소만 바꾸면 되고, Ollama 는 `LLM_BACKEND=ollama` 로 두면 됩니다. LangChain 으로 감싸 두어서 코드는 그대로입니다.
 - Windows 에서 스크립트를 돌릴 때는 `uv run python -X utf8 ...` 로 실행하세요. 공시 본문에 CP949 로 표현이 안 되는 문자(`㊦` 등)가 있어 그냥 돌리면 `UnicodeEncodeError` 로 멈춥니다.
 
 ### 서버 (RunPod)
@@ -346,7 +329,6 @@ uv run python -X utf8 scripts/test_dart_amounts.py    # 공시 단위 환산, �
 uv run python -X utf8 scripts/test_dart_classify.py   # 공시 유형 분류 (중요/일반/저정보)
 uv run python -X utf8 scripts/test_site_routing.py    # 사이트 질문 판별과 채팅 갈래
 uv run python -X utf8 scripts/test_kis_token.py       # KIS 토큰 동시 발급 방지
-uv run python -X utf8 scripts/test_llm_routing.py     # OpenRouter 양자화 고정
 uv run python -X utf8 scripts/test_keepalive.py       # 하트비트 응답
 ```
 
@@ -401,4 +383,4 @@ Dockerfile                   # vLLM + Qdrant + FastAPI 단일 이미지
 - **사이트 질문 판별은 단어 기반입니다.** 신호어가 없는 사이트 질문은 일반 갈래로 갑니다(일반 프롬프트에서 사이트 규칙을 추측하지 말라고 막아 둠). 종목명과 사이트 단어가 같이 있으면 사이트 갈래가 이겨서 종목 자료가 붙지 않습니다.
 - **공시 표 구조가 사라집니다.** DART 원문 표를 평문으로 펼쳐 저장해서, 칸 이름이 아예 없는 표는 금액 환산을 건너뜁니다. 틀린 금액을 만들지는 않습니다.
 - **파인튜닝은 보류했습니다.** 원래 QLoRA 로 용어 오류를 잡을 계획이었는데, 모델을 27B 로 바꾸면서 그 오류 유형이 사라졌습니다. 남은 문제(한자 혼입, 문체, OX 정답 쏠림)는 파인튜닝이 잘하는 영역이지만, 좁은 데이터로 튜닝하면 27B 를 고른 이유인 지식을 깎을 위험이 있습니다. 수집해 둔 데이터와 코드는 `archive/finetune-9b` 브랜치에 있습니다.
-- 일부 품질 수치(사이트 질문 40/40, 한자 혼입률)는 로컬(OpenRouter fp8) 기준이라 파드에서 다시 재야 합니다.
+- 일부 품질 수치(사이트 질문 40/40, 한자 혼입률)는 파드가 아닌 개발 환경에서 잰 것이라 파드에서 다시 재야 합니다.
