@@ -12,7 +12,7 @@
 
 | | |
 |---|---|
-| 기간 | 2026.05 ~ 2026.11 |
+| 기간 | 2026.03 ~ 2026.11 |
 | API 문서 | https://dmu-stockmate.github.io/stockmate-ai/ |
 | 서버 | RunPod H100 80GB 한 장, 컨테이너 하나 (vLLM + Qdrant + FastAPI) |
 | 모델 | Qwen3.8-27B (FP8), 임베딩 BAAI/bge-m3 |
