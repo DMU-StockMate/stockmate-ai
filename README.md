@@ -8,7 +8,7 @@
 
 졸업작품으로 프론트엔드(React), 백엔드(NestJS), AI 서버 세 저장소로 나눠 진행했습니다.
 이 저장소는 AI 서버이고, 설계부터 모델 선정, 서빙, 배포까지 혼자 맡았습니다.
-백엔드와 프론트 저장소는 비공개입니다.
+프론트엔드는 [StockMate_Front](https://github.com/DMU-StockMate/StockMate_Front), 백엔드는 [StockMate_Back](https://github.com/DMU-StockMate/StockMate_Back) 에 있습니다.
 
 | | |
 |---|---|
@@ -58,7 +58,7 @@
       └─ 나머지 ───────────────────────────────→ general : 모델 지식으로 개념 설명
 ```
 
-종목명은 DART 기업 코드 목록(약 3,960개)에서 찾습니다. "삼전", "하이닉스" 같은 줄임말 사전과 조사 제거("삼성전자랑" → "삼성전자")를 거친 뒤 퍼지 매칭합니다.
+종목명은 DART 기업 코드 목록 중 종목 코드가 있는 상장사(점검 당시 약 3,960곳)에서 찾습니다. "삼전", "하이닉스" 같은 줄임말 사전과 조사 제거("삼성전자랑" → "삼성전자")를 거친 뒤 퍼지 매칭합니다.
 
 `rag` 갈래에서는 종목마다 네이버 뉴스, DART 공시, DART 재무제표 적재를 **동시에** 돌리고, 시세(현재가, PER/PBR/EPS)는 KIS API 로 따로 받습니다. 한 소스가 실패해도 나머지로 답합니다.
 
@@ -246,7 +246,7 @@ AI 서버에서 100초 벽을 넘겼더니 그 위 계층에서 같은 벽을 �
 
 **해결** 프론트·백엔드 코드를 직접 읽고 확인한 사실만으로 사이트 안내서(`app/services/site/site_guide.md`, 약 4,500자)를 만들었습니다. 화면 문구와 서버 동작이 다르면 서버 동작을 따랐고, 확인 못 한 것은 "확인되지 않으니 약속하지 말 것"으로 적었습니다. 사이트 관련 단어가 있으면 종목 추출보다 먼저 이 갈래로 보냅니다. 사이트 프롬프트는 일반 프롬프트를 포함하도록 만들어서, 일반 질문이 잘못 분류돼도 답이 망가지지 않습니다.
 
-**결과** 같은 20개 질문을 2회씩 돌려 40/40 이 사이트 기준으로 답했습니다. 이 과정에서 화면 문구와 실제 서버 동작이 다른 곳 6군데를 찾아 따로 정리해 두었습니다.
+**결과** 같은 20개 질문을 2회씩 돌려 40/40 이 사이트 기준으로 답했습니다. 이 과정에서 화면 문구와 실제 서버 동작이 다른 곳 6군데도 찾아냈습니다.
 
 <br>
 
@@ -302,7 +302,7 @@ docker build -t <user>/stockmate-ai:<버전> .
 docker push <user>/stockmate-ai:<버전>
 ```
 
-이미지 하나가 `Qdrant → vLLM → FastAPI` 순서로 띄웁니다(`docker/entrypoint.sh`). 셋 중 하나라도 죽으면 컨테이너 전체를 내립니다. 반쯤 살아 있는 상태가 가장 디버깅하기 어렵기 때문입니다. RunPod 에서는 H100 80GB 파드에 Network Volume 을 `/workspace` 로 붙이고, 템플릿 환경변수에는 API 키 같은 비밀값만 넣습니다.
+이미지 하나가 `Qdrant → vLLM → FastAPI` 순서로 띄웁니다(`docker/entrypoint.sh`). Qdrant 나 vLLM 이 제한 시간 안에 준비되지 않으면 그 자리에서 컨테이너를 내리고, FastAPI 가 죽으면 컨테이너도 같이 내려갑니다. 반쯤 살아 있는 상태가 가장 디버깅하기 어렵기 때문입니다. RunPod 에서는 H100 80GB 파드에 Network Volume 을 `/workspace` 로 붙이고, 템플릿 환경변수에는 API 키 같은 비밀값만 넣습니다.
 
 리전 선택, 비용, 당일 체크리스트, 증상별 대응은 [`docs/runpod-runbook.md`](docs/runpod-runbook.md) 에 정리했습니다.
 
@@ -330,9 +330,13 @@ uv run python -X utf8 scripts/test_dart_classify.py   # 공시 유형 분류 (�
 uv run python -X utf8 scripts/test_site_routing.py    # 사이트 질문 판별과 채팅 갈래
 uv run python -X utf8 scripts/test_kis_token.py       # KIS 토큰 동시 발급 방지
 uv run python -X utf8 scripts/test_keepalive.py       # 하트비트 응답
+uv run python -X utf8 scripts/test_chat_stream.py     # SSE 변환, 빈 토큰 제거, 적재 실패 건너뛰기
+uv run python -X utf8 scripts/test_quiz_generator.py  # 일반·프롬프트 퀴즈 생성 파이프라인 (LLM 은 스텁)
+uv run python -X utf8 scripts/test_quiz_review.py     # 오답 기반 생성 (LLM 은 스텁)
+uv run python -X utf8 scripts/test_quiz_bank.py       # 중복 판정, Qdrant 가 죽어도 생성이 계속되는지
 ```
 
-이 밖에 퀴즈 생성·검증·뱅크·오답 퀴즈 테스트(`test_quiz_*.py`)는 LLM 이 필요합니다.
+`test_category_coverage.py`(전 카테고리 실제 생성)와 `test_realtime_rag.py`(답변과 원본 API 대조)는 LLM 서버와 API 키가 필요하고, 후자는 앱 서버가 떠 있어야 합니다.
 
 **측정 도구**
 
@@ -342,8 +346,8 @@ uv run python -X utf8 scripts/test_keepalive.py       # 하트비트 응답
 | `loadtest_api.py` | 동시 사용자 부하. 실패한 주제와 `keepalive_error` 를 같이 집계 |
 | `check_keepalive.py` | 프록시를 거쳐 하트비트가 실제로 나눠서 도착하는지 확인 |
 | `check_chat_stream.py` | 프록시를 거친 SSE 측정 (첫 글자, 빈 토큰 비율, 버퍼링) |
-| `compare_models.py` | 모델 비교 (용어 정확도, 카테고리 커버리지, 생성 결과) |
-| `reingest_disclosures.py` | 공시 적재 로직을 고친 뒤 기존 공시를 다시 적재 |
+| `compare_models.py` | 같은 입력(용어·퀴즈·RAG)을 다른 모델에 통과시켜 결과를 모음. 채점은 사람이 읽고 함 |
+| `reingest_disclosures.py` | 저장된 공시 문서를 지워, 다음 질문 때 바뀐 적재 로직으로 다시 쌓이게 함 |
 
 프록시를 거쳐 재는 도구를 따로 둔 이유는 4-1 과 같습니다. gzip 압축, 버퍼링, 100초 제한은 로컬에서는 보이지 않습니다.
 
@@ -369,7 +373,7 @@ app/
     ├── site/                # 사이트 질문 판별과 안내서
     └── external/            # DART, 네이버 뉴스, KIS 클라이언트
 docker/                      # 컨테이너 기동 스크립트, Qdrant 설정
-docs/                        # OpenAPI 문서(GitHub Pages), RunPod 런북
+docs/                        # OpenAPI 문서(GitHub Pages), RunPod 런북, README 구조도
 scripts/                     # 테스트, 벤치마크, 부하 테스트, 운영 스크립트
 Dockerfile                   # vLLM + Qdrant + FastAPI 단일 이미지
 ```
@@ -382,5 +386,5 @@ Dockerfile                   # vLLM + Qdrant + FastAPI 단일 이미지
 - **채팅 답변에 한자가 섞이는 경우가 약 5% 남아 있습니다.** 퀴즈는 검사에 걸리면 다시 만들지만, 채팅은 스트리밍이라 이미 보낸 글자를 되돌릴 수 없어 경고 로그로만 추적합니다.
 - **사이트 질문 판별은 단어 기반입니다.** 신호어가 없는 사이트 질문은 일반 갈래로 갑니다(일반 프롬프트에서 사이트 규칙을 추측하지 말라고 막아 둠). 종목명과 사이트 단어가 같이 있으면 사이트 갈래가 이겨서 종목 자료가 붙지 않습니다.
 - **공시 표 구조가 사라집니다.** DART 원문 표를 평문으로 펼쳐 저장해서, 칸 이름이 아예 없는 표는 금액 환산을 건너뜁니다. 틀린 금액을 만들지는 않습니다.
-- **파인튜닝은 보류했습니다.** 원래 QLoRA 로 용어 오류를 잡을 계획이었는데, 모델을 27B 로 바꾸면서 그 오류 유형이 사라졌습니다. 남은 문제(한자 혼입, 문체, OX 정답 쏠림)는 파인튜닝이 잘하는 영역이지만, 좁은 데이터로 튜닝하면 27B 를 고른 이유인 지식을 깎을 위험이 있습니다. 수집해 둔 데이터와 코드는 `archive/finetune-9b` 브랜치에 있습니다.
+- **파인튜닝은 보류했습니다.** 원래 QLoRA 로 용어 오류를 잡을 계획이었는데, 모델을 27B 로 바꾸면서 그 오류 유형이 사라졌습니다. 남은 문제(한자 혼입, 문체, OX 정답 쏠림)는 파인튜닝이 잘하는 영역이지만, 좁은 데이터로 튜닝하면 27B 를 고른 이유인 지식을 깎을 위험이 있습니다.
 - 일부 품질 수치(사이트 질문 40/40, 한자 혼입률)는 파드가 아닌 개발 환경에서 잰 것이라 파드에서 다시 재야 합니다.
